@@ -1,6 +1,6 @@
 # Order Support Chatbot — Tài liệu thiết kế
 
-Chatbot hỗ trợ đơn hàng mô phỏng một sàn thương mại điện tử: nhận câu hỏi về đơn hàng và tự tra cứu thông tin; **mọi thao tác động tới tiền (huỷ đơn, hoàn tiền) luôn cần con người duyệt trước khi chạy, bất kể số tiền**; yêu cầu vượt quyền thì escalate cho người. Python + FastAPI + Gemini API, kèm giao diện chat chạy trên trình duyệt.
+Chatbot hỗ trợ đơn hàng mô phỏng một sàn thương mại điện tử: nhận câu hỏi về đơn hàng và tự tra cứu thông tin; **hoàn tiền và hoàn hàng luôn cần con người duyệt trước khi chạy, bất kể số tiền; huỷ đơn chỉ tự chạy khi đơn còn `processing` (chưa đẩy hàng đi), đơn `shipped` thì cần duyệt**; yêu cầu vượt quyền thì escalate cho người. Python + FastAPI + Gemini API, kèm giao diện chat chạy trên trình duyệt.
 
 ## 1. Phạm vi
 
@@ -62,7 +62,7 @@ Trên CLI trước đây, bước duyệt là `input()` chặn luồng. Với AP
 - **UI**: bấm "Từ chối" thì thẻ duyệt mở ô nhập lý do (bắt buộc, tối đa 500 ký tự) cùng hai nút "Gửi từ chối" và "Quay lại". Chỉ khi bấm "Gửi từ chối" mới gọi API; "Quay lại" đưa thẻ về hai nút Duyệt / Từ chối.
 - **API**: `POST /approval` nhận `{approved, reason}`. `approved = false` mà `reason` thiếu, rỗng (chỉ khoảng trắng) hoặc quá 500 ký tự thì trả 400, lượt vẫn đang chờ duyệt. `approved = true` thì bỏ qua `reason`.
 - **Agent**: lý do đưa vào kết quả tool `{status: rejected_by_human, reason: <lý do của nhân viên>}`. System prompt yêu cầu LLM báo khách yêu cầu không được duyệt và nêu đúng lý do đó, không bịa thêm.
-- Áp dụng cho mọi thao tác cần duyệt do LLM đề xuất (huỷ đơn, hoàn tiền). Yêu cầu hoàn hàng cũng dùng ô lý do này nhưng thông báo cho khách bằng mẫu cố định (xem bên dưới).
+- Áp dụng cho mọi thao tác cần duyệt do LLM đề xuất (huỷ đơn đã `shipped`, hoàn tiền). Yêu cầu hoàn hàng cũng dùng ô lý do này nhưng thông báo cho khách bằng mẫu cố định (xem bên dưới).
 
 ### Luồng hoàn hàng
 
@@ -145,7 +145,8 @@ Phủ các tình huống: đơn bình thường, giao trễ, thanh toán lỗi, 
 | Tool | Điều kiện | Mức |
 |---|---|---|
 | `get_order(order_id)` | Chỉ đọc | **AUTO** |
-| `cancel_order(order_id)` | Đơn `processing` hoặc `shipped` | **NEEDS_APPROVAL** (luôn cần duyệt) |
+| `cancel_order(order_id)` | Đơn `processing` (chưa đẩy hàng đi) | **AUTO** (chạy ngay, không cần duyệt) |
+| | Đơn `shipped` (đã đẩy hàng đi) | **NEEDS_APPROVAL** (luôn cần duyệt) |
 | | Đơn `delivered` / `cancelled` / `returned`, hoặc mã đơn sai | **BLOCKED** (đơn `delivered` đủ điều kiện hoàn hàng thì lý do kèm gợi ý làm yêu cầu hoàn hàng; các trạng thái khác thì không gợi ý) |
 | `issue_refund(order_id, amount, reason)` | `payment_status = paid`, `amount > 0`, không vượt số còn hoàn được | **NEEDS_APPROVAL** (luôn cần duyệt, bất kể số tiền) |
 | | `payment_status ≠ paid`, hoặc `amount ≤ 0`, hoặc vượt số tiền còn hoàn được, hoặc mã đơn sai | **BLOCKED** |
@@ -153,7 +154,7 @@ Phủ các tình huống: đơn bình thường, giao trễ, thanh toán lỗi, 
 | `return_order(order_id, video, reason)` (nội bộ, **không** khai báo cho LLM, chỉ chạy từ yêu cầu hoàn hàng của khách) | Đơn `delivered`, `payment_status = paid`, số tiền còn hoàn được lớn hơn 0 | **NEEDS_APPROVAL** (luôn cần duyệt) |
 | | Đơn không `delivered` (kể cả đã `returned`), chưa thanh toán, đã hoàn hết, hoặc mã đơn sai | **BLOCKED** |
 
-**Quy tắc cốt lõi: không có đường tự động cho thao tác động tới tiền.** Huỷ đơn, hoàn tiền và hoàn hàng (hoàn hàng kéo theo hoàn tiền) luôn qua nhân viên duyệt, không có ngưỡng số tiền, không phụ thuộc trạng thái đơn. Lý do: thao tác tài chính không được để LLM hay luật tự quyết, đặc biệt trong bối cảnh vận hành tại Việt Nam. `BLOCKED` chỉ áp dụng cho yêu cầu không thể thực hiện (đơn đã giao/đã huỷ, chưa thanh toán, vượt số tiền của đơn), nên không hỏi nhân viên. Tổng tiền đã hoàn của đơn vẫn được tính để chặn hoàn vượt số tiền của đơn.
+**Quy tắc cốt lõi: không có đường tự động cho thao tác chuyển tiền.** Hoàn tiền và hoàn hàng (hoàn hàng kéo theo hoàn tiền) luôn qua nhân viên duyệt, không có ngưỡng số tiền, không phụ thuộc trạng thái đơn. Lý do: thao tác tài chính không được để LLM hay luật tự quyết, đặc biệt trong bối cảnh vận hành tại Việt Nam. **Huỷ đơn là ngoại lệ có điều kiện**: đơn `processing` chưa đẩy hàng đi và việc huỷ không tự hoàn tiền (hoàn tiền là thao tác riêng, vẫn cần duyệt) nên huỷ tự chạy; đơn `shipped` đã đẩy hàng đi nên huỷ vẫn cần nhân viên duyệt. `BLOCKED` chỉ áp dụng cho yêu cầu không thể thực hiện (đơn đã giao/đã huỷ, chưa thanh toán, vượt số tiền của đơn), nên không hỏi nhân viên. Tổng tiền đã hoàn của đơn vẫn được tính để chặn hoàn vượt số tiền của đơn.
 
 **Nguyên tắc chính**: LLM không có đường nào tự chạy được hành động nhạy cảm. Policy layer đánh giá dựa trên **dữ liệu thật của đơn**, không dựa vào lời LLM hay lời khách nói. Những yêu cầu không có tool tương ứng (ví dụ xoá tài khoản) thì agent gọi `escalate_to_human`. `return_order` không nằm trong danh sách tool của LLM nên LLM không có đường nào tự tạo hay tự duyệt hoàn hàng, chỉ khách (qua UI) tạo được yêu cầu và chỉ nhân viên duyệt được.
 
@@ -201,13 +202,14 @@ API tách 3 dòng này thành `summary` / `suggestion` / `case_status` cho clien
 | # | Khách nói | Kết quả mong đợi | Yêu cầu được chứng minh |
 |---|---|---|---|
 | 1 | "Đơn ORD-1001 của tôi đang ở đâu?" | Tra cứu, trả lời tự động | Phân tích request, tự xử lý việc chỉ đọc |
-| 2 | "Huỷ đơn ORD-1002" (đang `processing`) | Thẻ "Cần nhân viên duyệt"; chỉ huỷ khi bấm Duyệt | Huỷ đơn luôn cần duyệt |
+| 2 | "Huỷ đơn ORD-1002" (đang `processing`) | Huỷ ngay, không hiện thẻ duyệt; agent báo đã huỷ | Đơn chưa đẩy hàng đi thì tự xử lý |
+| 2b | "Huỷ đơn ORD-1006" (đã `shipped`) | Thẻ "Cần nhân viên duyệt"; chỉ huỷ khi bấm Duyệt | Đơn đã đẩy hàng đi thì cần duyệt |
 | 3 | "Hoàn 200$ cho ORD-1004" | Thẻ "Cần nhân viên duyệt", bấm Duyệt/Từ chối | Human approval |
 | 3b | "Hoàn 30$ cho ORD-1005" | Vẫn có thẻ duyệt dù số tiền nhỏ | Hoàn tiền luôn cần duyệt, không có ngưỡng |
 | 4 | "Huỷ đơn ORD-1005" (đã `delivered`) | BLOCKED, agent giải thích và gợi ý hoàn hàng, dialog mời làm yêu cầu hoàn hàng hiện ra | Guardrail, gợi ý bước tiếp theo |
 | 5 | "Xoá tài khoản của tôi" | Escalate cho người | Vượt quyền hạn |
 | 6 | "Đơn của tôi đâu?" / `ORD-9999` | Hỏi lại / báo không tồn tại | Input không hợp lệ |
-| 7 | "Huỷ đơn ORD-1002", bấm Từ chối và nhập lý do | Không nhập lý do thì không gửi được; có lý do thì khách nhận câu trả lời nêu đúng lý do đó | Lý do từ chối gửi lại cho khách |
+| 7 | "Huỷ đơn ORD-1006" (đã `shipped`), bấm Từ chối và nhập lý do | Không nhập lý do thì không gửi được; có lý do thì khách nhận câu trả lời nêu đúng lý do đó | Lý do từ chối gửi lại cho khách |
 | 8 | Như #4, chọn Không ở dialog | Dialog đóng, chat tiếp bình thường | Khách có thể bỏ qua hoàn hàng |
 | 9 | Như #4, chọn Có, nhập video và lý do, nhân viên bấm Duyệt | Đơn thành `returned`, hoàn đủ tiền, khách nhận thông báo kèm số tiền | Hoàn hàng qua duyệt |
 | 10 | Như #9 nhưng nhân viên bấm Từ chối và nhập lý do | Đơn không đổi, khách nhận thông báo kèm lý do, kết thúc luồng | Từ chối hoàn hàng |
@@ -216,7 +218,7 @@ API tách 3 dòng này thành `summary` / `suggestion` / `case_status` cho clien
 
 1. **Model**: mặc định trong code là `gemini-3.5-flash-lite`, đổi được qua biến `GEMINI_MODEL` trong `.env`.
 2. **SDK**: dùng `google-genai` (SDK chính thức mới của Google), không dùng `google-generativeai` đã cũ.
-3. **Quy tắc tiền**: huỷ đơn và hoàn tiền luôn cần người duyệt, không có ngưỡng; chỉ có ngưỡng 500 để gắn cờ cảnh báo đơn giá trị cao (không ảnh hưởng việc duyệt).
+3. **Quy tắc tiền**: hoàn tiền và hoàn hàng luôn cần người duyệt, không có ngưỡng; huỷ đơn `processing` tự chạy (chưa đẩy hàng đi, không kèm hoàn tiền), huỷ đơn `shipped` cần duyệt; chỉ có ngưỡng 500 để gắn cờ cảnh báo đơn giá trị cao (không ảnh hưởng việc duyệt).
 4. **Ngôn ngữ giao tiếp**: agent trả lời theo ngôn ngữ khách dùng (Việt hoặc Anh); giao diện bằng tiếng Việt.
 5. **Dữ liệu**: chỉ lưu trong bộ nhớ, mỗi phiên một bản sao riêng của dữ liệu mẫu (thay đổi chỉ có hiệu lực trong phiên đó), mất khi phiên bị bỏ hoặc server khởi động lại.
 6. **Không xác thực**: ai cũng gọi được endpoint duyệt. Chấp nhận được cho bản mô phỏng; bản thật phải tách quyền nhân viên.

@@ -109,6 +109,6 @@ def detect_issues(order: dict) -> list[str]:
         days_late = (TODAY - date.fromisoformat(order["expected_delivery"])).days
         if days_late > 0:
             issues.append(f"late_delivery: giao trễ {days_late} ngày")
-    if status == "processing" and order["total"] > HIGH_VALUE_THRESHOLD:
+    if order["total"] > HIGH_VALUE_THRESHOLD:
         issues.append(f"high_value_pending: đơn giá trị cao ({order['total']:.2f}) đang chờ xử lý")
     return issues
