@@ -1,8 +1,13 @@
-"""Vòng lặp agent: Gemini đề xuất gọi tool, policy quyết định, người duyệt khi cần."""
+"""Vòng lặp agent: Gemini đề xuất gọi tool, policy quyết định, người duyệt khi cần.
+
+Agent không chặn để chờ người duyệt. Khi một tool cần duyệt, lượt hội thoại tạm dừng và
+`chat` trả về TurnResult(status="pending_approval"); `resolve_approval` chạy tiếp đúng từ chỗ đó.
+"""
 
 import json
 import os
 import time
+from dataclasses import dataclass, field
 
 from google import genai
 from google.genai import types
@@ -11,7 +16,10 @@ import policy
 import tools
 import agent_trace as trace
 
-MAX_TOOL_CALLS = 5  # giới hạn số lượt gọi tool cho mỗi tin nhắn của khách
+MAX_TOOL_CALLS = 5  # giới hạn số lượt gọi Gemini cho mỗi tin nhắn của khách
+
+REPLY = "reply"
+PENDING_APPROVAL = "pending_approval"
 
 SYSTEM_PROMPT = """You are a customer support agent for an online shop.
 Reply in the same language the customer uses.
@@ -31,12 +39,36 @@ Tóm tắt: <the customer's issue / the order situation>
 Đề xuất: <the recommended next action>
 Trạng thái: <one of: ĐÃ XỬ LÝ | CHỜ DUYỆT | ĐÃ ESCALATE | CẦN THÊM THÔNG TIN>"""
 
-SCAN_PROMPT = """You are an operations assistant for an online shop. Below are orders flagged
-by automatic rules. For each one write a short block in Vietnamese:
-[ORDER_ID] <issue>
-  Tóm tắt: <1 sentence>
-  Đề xuất: <recommended next action for the support staff>
-Only recommend; do not claim any action was taken. Use only the data given."""
+ERROR_REPLY = "Xin lỗi, hệ thống đang gặp lỗi ({error}). Vui lòng thử lại sau."
+
+
+class ApprovalStateError(Exception):
+    """Gọi sai thứ tự: gửi tin khi đang chờ duyệt, hoặc duyệt khi không có yêu cầu nào."""
+
+
+@dataclass
+class ToolEvent:
+    """Một lần agent gọi tool trong lượt này, để UI hiển thị quyết định của guardrail."""
+    tool: str
+    args: dict
+    level: str  # AUTO | NEEDS_APPROVAL | BLOCKED
+    reason: str
+    outcome: str  # executed | blocked | awaiting_approval | approved | rejected | error
+
+
+@dataclass
+class PendingApproval:
+    tool: str
+    args: dict
+    reason: str
+
+
+@dataclass
+class TurnResult:
+    status: str  # REPLY | PENDING_APPROVAL
+    reply: str | None = None
+    approval: PendingApproval | None = None
+    tool_events: list[ToolEvent] = field(default_factory=list)
 
 
 def make_client() -> genai.Client:
@@ -47,25 +79,9 @@ def model_name() -> str:
     return os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 
-def ask_human(tool_name: str, args: dict, reason: str) -> bool:
-    """Hỏi người duyệt trên CLI. Mặc định từ chối nếu không nhận được câu trả lời."""
-    print("\n  +-- CẦN DUYỆT -------------------------------------")
-    print(f"  | Hành động : {tool_name}")
-    print(f"  | Tham số   : {json.dumps(args, ensure_ascii=False)}")
-    print(f"  | Lý do     : {reason}")
-    print("  +--------------------------------------------------")
-    while True:
-        try:
-            answer = input("  Duyệt? [y/n]: ").strip().lower()
-        except EOFError:
-            return False
-        if answer in ("y", "yes"):
-            return True
-        if answer in ("n", "no"):
-            return False
-
-
 class SupportAgent:
+    """Một hội thoại. Không thread-safe: tầng gọi phải tuần tự hoá các lượt của cùng một phiên."""
+
     def __init__(self, client: genai.Client):
         self.client = client
         self.history: list[types.Content] = []
@@ -75,66 +91,119 @@ class SupportAgent:
             # Tắt tự động gọi tool để mình chèn policy vào giữa.
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
+        # Trạng thái của lượt đang chạy dở (chỉ có ý nghĩa khi đang chờ duyệt).
+        self._checkpoint = 0
+        self._step = 0
+        self._message = ""
+        self._calls: list = []  # các function call Gemini đề xuất trong bước hiện tại
+        self._results: list[types.Part] = []  # kết quả đã có, theo đúng thứ tự _calls
+        self._pending: PendingApproval | None = None
+        self._events: list[ToolEvent] = []
 
-    def chat(self, message: str) -> str:
-        checkpoint = len(self.history)
+    @property
+    def pending(self) -> PendingApproval | None:
+        return self._pending
+
+    def chat(self, message: str) -> TurnResult:
+        if self._pending:
+            raise ApprovalStateError("đang chờ nhân viên duyệt một yêu cầu")
+        return self._guarded(lambda: self._start_turn(message))
+
+    def resolve_approval(self, approved: bool) -> TurnResult:
+        if not self._pending:
+            raise ApprovalStateError("không có yêu cầu nào đang chờ duyệt")
+        return self._guarded(lambda: self._resume(approved))
+
+    # --- điều khiển lượt hội thoại ---
+
+    def _guarded(self, run) -> TurnResult:
+        self._events = []
         try:
-            return self._run_turn(message)
+            return run()
         except Exception as e:
-            self.history = self.history[:checkpoint]  # bỏ lượt dở để lịch sử không bị hỏng
+            self._rollback()  # bỏ lượt dở để lịch sử không bị hỏng
             trace.log(f"LỖI {type(e).__name__}", str(e))
-            return f"Xin lỗi, hệ thống đang gặp lỗi ({type(e).__name__}). Vui lòng thử lại sau."
+            return self._reply(ERROR_REPLY.format(error=type(e).__name__))
 
-    def _run_turn(self, message: str) -> str:
-        checkpoint = len(self.history)
+    def _start_turn(self, message: str) -> TurnResult:
+        self._checkpoint = len(self.history)
+        self._step = 0
+        self._message = message
         self.history.append(types.Content(role="user", parts=[types.Part(text=message)]))
         trace.log("-" * 60)
         trace.log("KHÁCH", message)
+        return self._advance()
 
-        for step in range(1, MAX_TOOL_CALLS + 1):
+    def _advance(self) -> TurnResult:
+        """Gọi Gemini lặp lại cho tới khi có câu trả lời, cần duyệt, hoặc hết lượt."""
+        while self._step < MAX_TOOL_CALLS:
+            self._step += 1
             started = time.perf_counter()
             response = self.client.models.generate_content(
                 model=model_name(), contents=self.history, config=self.config
             )
-            trace.log_llm_call(step, model_name(), time.perf_counter() - started, response)
+            trace.log_llm_call(self._step, model_name(), time.perf_counter() - started, response)
             if not response.candidates or response.candidates[0].content is None:
-                self.history = self.history[:checkpoint]
-                return self._escalate(f"Gemini không trả về nội dung. Tin nhắn khách: {message[:200]}")
+                self._rollback()
+                return self._escalate("Gemini không trả về nội dung.")
             self.history.append(response.candidates[0].content)
 
             calls = response.function_calls
             if not calls:
                 answer = response.text or "Xin lỗi, tôi chưa có câu trả lời phù hợp."
                 trace.log("TRẢ LỜI KHÁCH", answer)
-                return answer
+                return self._reply(answer)
 
-            parts = [
-                types.Part.from_function_response(name=c.name, response=self._run_tool(c.name, dict(c.args or {})))
-                for c in calls
-            ]
-            self.history.append(types.Content(role="user", parts=parts))
+            self._calls, self._results = list(calls), []
+            paused = self._run_calls()
+            if paused:
+                return paused
 
-        # Quá số lượt gọi tool cho phép: dừng và giao cho người.
-        self.history = self.history[:checkpoint]
-        return self._escalate(f"Agent vượt quá {MAX_TOOL_CALLS} lượt gọi tool. Tin nhắn khách: {message[:200]}")
+        # Quá số lượt cho phép: dừng và giao cho người.
+        self._rollback()
+        return self._escalate(f"Agent vượt quá {MAX_TOOL_CALLS} lượt gọi tool.")
 
-    def _escalate(self, summary: str) -> str:
-        trace.log("ESCALATE (do hệ thống, không phải LLM)", summary)
-        tools.escalate_to_human(summary)
-        return ("Yêu cầu này cần nhân viên hỗ trợ xử lý, tôi đã chuyển cho họ.\n"
-                "Tóm tắt: agent không thể tự xử lý yêu cầu này\n"
-                "Đề xuất: chờ nhân viên liên hệ\n"
-                "Trạng thái: ĐÃ ESCALATE")
+    def _run_calls(self) -> TurnResult | None:
+        """Chạy các tool Gemini đề xuất. Trả về TurnResult nếu phải dừng chờ duyệt, ngược lại None."""
+        while len(self._results) < len(self._calls):
+            call = self._calls[len(self._results)]
+            args = dict(call.args or {})
+            result = self._handle_call(call.name, args)
+            if result is None:
+                return TurnResult(PENDING_APPROVAL, approval=self._pending, tool_events=self._events)
+            self._collect(call.name, result)
+        self.history.append(types.Content(role="user", parts=self._results))
+        self._calls, self._results = [], []
+        return None
 
-    def _run_tool(self, name: str, args: dict) -> dict:
-        result = self._execute_tool(name, args)
-        trace.log(f"  Kết quả tool gửi lại cho LLM: {name}", result)
-        return result
+    def _resume(self, approved: bool) -> TurnResult:
+        pending, self._pending = self._pending, None
+        trace.log(f"  Người duyệt: {'ĐỒNG Ý' if approved else 'TỪ CHỐI'}")
+        if not approved:
+            self._event(pending.tool, pending.args, policy.NEEDS_APPROVAL, pending.reason, "rejected")
+            result = {"status": "rejected_by_human", "reason": "nhân viên không duyệt yêu cầu này"}
+        else:
+            # Dữ liệu có thể đã đổi từ lúc xin duyệt (phiên khác huỷ cùng đơn...), nên kiểm lại.
+            order, _ = tools.find_order(pending.args.get("order_id"))
+            decision = policy.evaluate(pending.tool, pending.args, order)
+            if decision.level == policy.BLOCKED:
+                self._event(pending.tool, pending.args, decision.level, decision.reason, "blocked")
+                result = {"status": "blocked", "reason": decision.reason}
+            else:
+                result = self._execute(pending.tool, pending.args, policy.NEEDS_APPROVAL, pending.reason)
+                result["approved_by_human"] = True
+        self._collect(pending.tool, result)
 
-    def _execute_tool(self, name: str, args: dict) -> dict:
-        fn = tools.TOOLS.get(name)
-        if fn is None:
+        paused = self._run_calls()
+        return paused or self._advance()
+
+    # --- thực thi tool ---
+
+    def _handle_call(self, name: str, args: dict) -> dict | None:
+        """Trả về kết quả tool để gửi lại cho Gemini, hoặc None nếu cần dừng chờ duyệt."""
+        if name not in tools.TOOLS:
             trace.log(f"  TOOL {name}: không tồn tại", args)
+            self._event(name, args, policy.BLOCKED, "tool không tồn tại", "blocked")
             return {"ok": False, "error": f"unknown tool: {name}"}
 
         order, _ = tools.find_order(args.get("order_id"))
@@ -144,48 +213,46 @@ class SupportAgent:
         trace.log(f"  Policy: {decision.level}", decision.reason)
 
         if decision.level == policy.BLOCKED:
+            self._event(name, args, decision.level, decision.reason, "blocked")
             return {"status": "blocked", "reason": decision.reason}
         if decision.level == policy.NEEDS_APPROVAL:
-            approved = ask_human(name, args, decision.reason)
-            trace.log(f"  Người duyệt: {'ĐỒNG Ý' if approved else 'TỪ CHỐI'}")
-            if not approved:
-                return {"status": "rejected_by_human", "reason": "nhân viên không duyệt yêu cầu này"}
+            self._pending = PendingApproval(name, args, decision.reason)
+            self._event(name, args, decision.level, decision.reason, "awaiting_approval")
+            return None
+        return self._execute(name, args, decision.level, decision.reason)
 
+    def _execute(self, name: str, args: dict, level: str, reason: str) -> dict:
+        outcome = "executed" if level == policy.AUTO else "approved"
         try:
-            result = fn(**args)
+            result = tools.TOOLS[name](**args)
         except TypeError:
-            return {"ok": False, "error": "invalid or missing arguments"}
+            result, outcome = {"ok": False, "error": "invalid or missing arguments"}, "error"
         except Exception as e:
-            return {"ok": False, "error": f"tool failed: {type(e).__name__}"}
-        if decision.level == policy.NEEDS_APPROVAL:
-            result["approved_by_human"] = True
+            result, outcome = {"ok": False, "error": f"tool failed: {type(e).__name__}"}, "error"
+        self._event(name, args, level, reason, outcome)
         return result
 
+    def _collect(self, name: str, result: dict) -> None:
+        trace.log(f"  Kết quả tool gửi lại cho LLM: {name}", result)
+        self._results.append(types.Part.from_function_response(name=name, response=result))
 
-def run_scan(client: genai.Client) -> str:
-    """Quét mọi đơn bằng luật cố định, nhờ Gemini viết tóm tắt và đề xuất. Chỉ đọc, không thực thi gì."""
-    flagged = []
-    for order in tools.ORDERS.values():
-        issues = policy.detect_issues(order)
-        if issues:
-            flagged.append({"order_id": order["order_id"], "customer": order["customer_name"],
-                            "total": order["total"], "status": order["status"],
-                            "payment_status": order["payment_status"], "issues": issues})
+    # --- tiện ích ---
 
-    header = f"Đã quét {len(tools.ORDERS)} đơn, phát hiện {len(flagged)} đơn cần chú ý."
-    trace.log("SCAN: kết quả detect_issues (luật cố định, chưa dùng LLM)", flagged)
-    if not flagged:
-        return header
+    def _event(self, tool: str, args: dict, level: str, reason: str, outcome: str) -> None:
+        self._events.append(ToolEvent(tool, args, level, reason, outcome))
 
-    started = time.perf_counter()
-    response = client.models.generate_content(
-        model=model_name(),
-        contents=json.dumps(flagged, ensure_ascii=False),
-        config=types.GenerateContentConfig(
-            system_instruction=SCAN_PROMPT,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        ),
-    )
-    trace.log_llm_call(1, model_name(), time.perf_counter() - started, response)
-    trace.log("SCAN: báo cáo Gemini viết", response.text)
-    return f"{header}\n\n{response.text or '(Gemini không trả về nội dung)'}"
+    def _rollback(self) -> None:
+        self.history = self.history[:self._checkpoint]
+        self._calls, self._results, self._pending = [], [], None
+
+    def _reply(self, text: str) -> TurnResult:
+        return TurnResult(REPLY, reply=text, tool_events=self._events)
+
+    def _escalate(self, summary: str) -> TurnResult:
+        summary = f"{summary} Tin nhắn khách: {self._message[:200]}"
+        trace.log("ESCALATE (do hệ thống, không phải LLM)", summary)
+        tools.escalate_to_human(summary)
+        return self._reply("Yêu cầu này cần nhân viên hỗ trợ xử lý, tôi đã chuyển cho họ.\n"
+                           "Tóm tắt: agent không thể tự xử lý yêu cầu này\n"
+                           "Đề xuất: chờ nhân viên liên hệ\n"
+                           "Trạng thái: ĐÃ ESCALATE")

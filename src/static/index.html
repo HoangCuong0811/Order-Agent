@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat</title>
+<style>
+  :root {
+    --ivory: #0d0d0e;
+    --paper: #131314;
+    --ink: #e9e5db;
+    --muted: #8b867b;
+    --line: #2a2926;
+    --gold: #c4a265;
+    --gold-soft: #1c1913;
+    --bad: #d9786b;
+    --user: #25231f;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--ivory); color: var(--ink);
+    font: 15px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; justify-content: center;
+  }
+  button { font: inherit; cursor: pointer; }
+
+  .app { width: 100%; max-width: 720px; height: 100%; display: flex; flex-direction: column; background: var(--paper); border-inline: 1px solid var(--line); }
+
+  header { padding: 16px 28px; display: flex; justify-content: flex-end; }
+  .link { background: none; border: 0; padding: 4px 0; color: var(--muted); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; border-bottom: 1px solid transparent; }
+  .link:hover { color: var(--ink); border-bottom-color: var(--gold); }
+
+  .messages { flex: 1; overflow-y: auto; padding: 28px; display: flex; flex-direction: column; gap: 22px; }
+  .msg { max-width: 82%; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { align-self: flex-end; background: var(--user); border: 1px solid var(--line); padding: 10px 16px; border-radius: 2px; }
+  .msg.bot { align-self: flex-start; padding-left: 16px; border-left: 1px solid var(--gold); }
+  .msg.error { color: var(--bad); border-left-color: var(--bad); }
+  .msg strong { font-weight: 600; }
+
+  .typing { align-self: flex-start; padding-left: 16px; border-left: 1px solid var(--gold); color: var(--gold); letter-spacing: .3em; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  .approval { align-self: flex-start; width: min(100%, 420px); border: 1px solid var(--gold); background: var(--gold-soft); padding: 16px 18px; }
+  .approval h4 { margin: 0 0 10px; font: 400 16px/1.2 Georgia, serif; letter-spacing: .03em; }
+  .approval dl { margin: 0 0 14px; display: grid; grid-template-columns: auto 1fr; gap: 3px 16px; font-size: 14px; }
+  .approval dt { color: var(--muted); }
+  .approval dd { margin: 0; }
+  .approval .actions { display: flex; gap: 10px; }
+  .approval button { flex: 1; padding: 9px; border: 1px solid var(--muted); background: transparent; color: var(--ink); letter-spacing: .1em; text-transform: uppercase; font-size: 12px; }
+  .approval .yes { background: var(--gold); border-color: var(--gold); color: #131314; }
+  .approval button:hover { opacity: .85; }
+  .approval.done { border-color: var(--line); background: transparent; }
+  .approval.done h4 { color: var(--muted); }
+
+  form { display: flex; align-items: flex-end; gap: 16px; padding: 14px 28px 22px; border-top: 1px solid var(--line); }
+  textarea {
+    flex: 1; resize: none; max-height: 120px; border: 0; border-bottom: 1px solid var(--line); background: transparent;
+    padding: 8px 0; font: inherit; color: var(--ink); outline: none; overflow-y: hidden;
+  }
+  textarea:focus { border-bottom-color: var(--gold); }
+  textarea:disabled { opacity: .5; }
+  textarea::placeholder { color: var(--muted); }
+  .send { background: none; border: 0; padding: 8px 0; color: var(--gold); font-size: 12px; letter-spacing: .18em; text-transform: uppercase; border-bottom: 1px solid var(--gold); }
+  .send:disabled { color: var(--line); border-bottom-color: var(--line); cursor: default; }
+
+  @media (max-width: 520px) {
+    header, form { padding-inline: 18px; }
+    .messages { padding: 20px 18px; }
+    .msg { max-width: 92%; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <button class="link" id="new" type="button">Mới</button>
+  </header>
+  <div class="messages" id="messages" role="log" aria-live="polite"></div>
+  <form id="composer">
+    <textarea id="input" rows="1" maxlength="1000" placeholder="Nhập tin nhắn" aria-label="Tin nhắn"></textarea>
+    <button class="send" id="send" type="submit">Gửi</button>
+  </form>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const messagesEl = $("messages"), inputEl = $("input"), sendEl = $("send");
+
+const WELCOME = "Xin chào, tôi có thể giúp bạn tra cứu đơn hàng, huỷ đơn hoặc hoàn tiền. Vui lòng cho tôi mã đơn hàng, ví dụ ORD-1001.";
+const TOOL_LABEL = { cancel_order: "Huỷ đơn", issue_refund: "Hoàn tiền" };
+
+let sessionId = null, busy = false, pending = false;
+
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function fmt(text) { return esc(text).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/^[*-] /gm, "• "); }
+function add(cls, html) {
+  const d = document.createElement("div");
+  d.className = cls;
+  d.innerHTML = html;
+  messagesEl.appendChild(d);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return d;
+}
+function refresh() {
+  inputEl.disabled = sendEl.disabled = busy || pending;
+  inputEl.placeholder = pending ? "Đang chờ nhân viên duyệt" : "Nhập tin nhắn";
+  if (!inputEl.disabled) inputEl.focus();
+}
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) { const e = new Error((data && data.detail) || `Lỗi ${res.status}`); e.status = res.status; throw e; }
+  return data;
+}
+
+function approvalCard(a) {
+  const args = a.args || {};
+  const rows = [["Hành động", TOOL_LABEL[a.tool] || a.tool]];
+  if (args.order_id) rows.push(["Mã đơn", args.order_id]);
+  if (args.amount !== undefined) rows.push(["Số tiền", args.amount]);
+  rows.push(["Lý do", a.reason]);
+  const card = add("approval", `<h4>Cần nhân viên duyệt</h4>
+    <dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+    <div class="actions"><button class="yes" type="button">Duyệt</button><button type="button">Từ chối</button></div>`);
+  const [yes, no] = card.querySelectorAll("button");
+  yes.onclick = () => decide(card, true);
+  no.onclick = () => decide(card, false);
+}
+
+function render(r) {
+  if (r.status === "pending_approval") {
+    pending = true;
+    approvalCard(r.approval);
+  } else {
+    add("msg bot", fmt(r.reply || ""));
+  }
+}
+
+async function turn(request) {
+  busy = true; refresh();
+  const typing = add("typing", "···");
+  try {
+    render(await request());
+  } catch (e) {
+    if (e.status === 404) {
+      try { await newSession(); add("msg bot error", "Phiên cũ đã hết hạn, đã mở cuộc trò chuyện mới. Vui lòng gửi lại tin nhắn."); }
+      catch (_) { add("msg bot error", "Không kết nối được máy chủ."); }
+    } else {
+      add("msg bot error", esc(e.message));
+    }
+  } finally {
+    typing.remove();
+    busy = false; refresh();
+  }
+}
+
+function send() {
+  const text = inputEl.value.trim();
+  if (!text || busy || pending || !sessionId) return;
+  add("msg user", esc(text));
+  inputEl.value = "";
+  grow();
+  turn(() => api(`/api/sessions/${sessionId}/messages`, { message: text }));
+}
+
+function decide(card, approved) {
+  card.classList.add("done");
+  card.querySelector("h4").textContent = approved ? "Đã duyệt" : "Đã từ chối";
+  card.querySelector(".actions").remove();
+  pending = false;
+  turn(() => api(`/api/sessions/${sessionId}/approval`, { approved }));
+}
+
+async function newSession() { sessionId = (await api("/api/sessions")).session_id; }
+
+async function start() {
+  messagesEl.innerHTML = "";
+  pending = false;
+  add("msg bot", esc(WELCOME));
+  busy = true; refresh();
+  try { await newSession(); } catch (e) { add("msg bot error", "Không kết nối được máy chủ: " + esc(e.message)); }
+  busy = false; refresh();
+}
+
+function grow() {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + "px";
+  inputEl.style.overflowY = inputEl.scrollHeight > 120 ? "auto" : "hidden";
+}
+inputEl.addEventListener("input", grow);
+inputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+$("composer").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+$("new").onclick = () => { if (!busy) start(); };
+
+start();
+</script>
+</body>
+</html>
