@@ -1,0 +1,110 @@
+[
+  {
+    "order_id": "ORD-1001",
+    "customer_name": "Hoang The Cuong",
+    "email": "an.nguyen@example.com",
+    "items": ["Wireless Mouse", "USB-C Cable"],
+    "total": 89.90,
+    "status": "shipped",
+    "payment_status": "paid",
+    "order_date": "2026-10-03",
+    "expected_delivery": "2026-10-09",
+    "shipping_address": "12 Le Loi, District 1, Ho Chi Minh City"
+  },
+  {
+    "order_id": "ORD-1002",
+    "customer_name": "Hoang The Cuong",
+    "email": "binh.tran@example.com",
+    "items": ["Phone Case"],
+    "total": 35.00,
+    "status": "processing",
+    "payment_status": "paid",
+    "order_date": "2026-10-06",
+    "expected_delivery": "2026-10-12",
+    "shipping_address": "45 Nguyen Hue, District 1, Ho Chi Minh City"
+  },
+  {
+    "order_id": "ORD-1003",
+    "customer_name": "Le Van Cuong",
+    "email": "cuong.le@example.com",
+    "items": ["Mechanical Keyboard"],
+    "total": 120.00,
+    "status": "processing",
+    "payment_status": "failed",
+    "order_date": "2026-10-04",
+    "expected_delivery": "2026-10-12",
+    "shipping_address": "78 Tran Hung Dao, Hanoi"
+  },
+  {
+    "order_id": "ORD-1004",
+    "customer_name": "Pham Thi Dung",
+    "email": "dung.pham@example.com",
+    "items": ["Noise-Cancelling Headphones"],
+    "total": 249.00,
+    "status": "delivered",
+    "payment_status": "paid",
+    "order_date": "2026-09-28",
+    "expected_delivery": "2026-10-03",
+    "shipping_address": "9 Hai Ba Trung, Da Nang"
+  },
+  {
+    "order_id": "ORD-1005",
+    "customer_name": "Hoang Van Em",
+    "email": "em.hoang@example.com",
+    "items": ["Notebook", "Pen Set"],
+    "total": 45.00,
+    "status": "delivered",
+    "payment_status": "paid",
+    "order_date": "2026-09-30",
+    "expected_delivery": "2026-10-04",
+    "shipping_address": "33 Pasteur, District 3, Ho Chi Minh City"
+  },
+  {
+    "order_id": "ORD-1006",
+    "customer_name": "Vo Thi Phuong",
+    "email": "phuong.vo@example.com",
+    "items": ["Desk Lamp"],
+    "total": 75.50,
+    "status": "shipped",
+    "payment_status": "paid",
+    "order_date": "2026-09-29",
+    "expected_delivery": "2026-10-03",
+    "shipping_address": "21 Bach Dang, Hai Phong"
+  },
+  {
+    "order_id": "ORD-1007",
+    "customer_name": "Dang Van Giang",
+    "email": "giang.dang@example.com",
+    "items": ["Backpack"],
+    "total": 60.00,
+    "status": "processing",
+    "payment_status": "paid",
+    "order_date": "2026-10-05",
+    "expected_delivery": "2026-10-12",
+    "shipping_address": ""
+  },
+  {
+    "order_id": "ORD-1008",
+    "customer_name": "Bui Thi Hoa",
+    "email": "hoa.bui@example.com",
+    "items": ["Gaming Laptop"],
+    "total": 899.00,
+    "status": "processing",
+    "payment_status": "paid",
+    "order_date": "2026-10-06",
+    "expected_delivery": "2026-10-13",
+    "shipping_address": "5 Ly Thuong Kiet, Hue"
+  },
+  {
+    "order_id": "ORD-1009",
+    "customer_name": "Ngo Van Khoa",
+    "email": "khoa.ngo@example.com",
+    "items": ["Water Bottle"],
+    "total": 30.00,
+    "status": "cancelled",
+    "payment_status": "refunded",
+    "order_date": "2026-10-01",
+    "expected_delivery": "2026-10-07",
+    "shipping_address": "60 Vo Van Tan, District 3, Ho Chi Minh City"
+  }
+]
