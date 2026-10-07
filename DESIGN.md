@@ -165,7 +165,7 @@ Luật cố định trong code, `get_order` trả kèm kết quả để agent t
 - `payment_failed`: `payment_status = failed`
 - `late_delivery`: quá `expected_delivery` mà `status` chưa `delivered`
 - `missing_address`: địa chỉ giao trống
-- `high_value_pending`: đơn `processing` có `total` lớn hơn 500 (cần kiểm tra thủ công)
+- `high_value_pending`: đơn có `total` lớn hơn 500, áp dụng cho mọi trạng thái đơn (không chỉ `processing`; cần kiểm tra thủ công)
 
 Đơn `cancelled` và `returned` không trả vấn đề nào.
 
@@ -213,6 +213,47 @@ API tách 3 dòng này thành `summary` / `suggestion` / `case_status` cho clien
 | 8 | Như #4, chọn Không ở dialog | Dialog đóng, chat tiếp bình thường | Khách có thể bỏ qua hoàn hàng |
 | 9 | Như #4, chọn Có, nhập video và lý do, nhân viên bấm Duyệt | Đơn thành `returned`, hoàn đủ tiền, khách nhận thông báo kèm số tiền | Hoàn hàng qua duyệt |
 | 10 | Như #9 nhưng nhân viên bấm Từ chối và nhập lý do | Đơn không đổi, khách nhận thông báo kèm lý do, kết thúc luồng | Từ chối hoàn hàng |
+
+### Case kiểm thử chuẩn
+
+Năm case dùng để chạy thử và đối chiếu kết quả. Mỗi case chạy trong một phiên mới (nút "Mới"), vì dữ liệu đơn là riêng của từng phiên và một số case làm đổi đơn. Câu hỏi là câu gõ nguyên văn vào chat.
+
+**Case 1: Hỏi thông tin đơn hàng**
+
+- Câu hỏi: `Cho tôi thông tin về order có mã ORD-1001`
+- Dữ liệu: ORD-1001, `shipped`, `paid`, tổng 89.90, hàng gồm Wireless Mouse và USB-C Cable, dự kiến giao 2026-10-09, `detect_issues` không có cảnh báo nào.
+- Mong đợi: agent gọi `get_order` (AUTO, chạy ngay) và trả về đúng thông tin của đơn. Không hiện thẻ duyệt, không có cảnh báo.
+
+**Case 2: Hỏi đơn có thông tin đáng chú ý (phát hiện bất thường)**
+
+- Câu hỏi: `Cho tôi thông tin về order có mã ORD-1008`
+- Dữ liệu: ORD-1008, `processing`, `paid`, tổng 899.00 (vượt ngưỡng 500), `get_order` trả kèm `high_value_pending`.
+- Mong đợi: agent trả thông tin đơn và **nhắc người dùng đơn có giá trị cao, cần kiểm tra thủ công**. Chỉ tra cứu, không hiện thẻ duyệt và không tự làm thêm gì.
+- Lưu ý khi kiểm: việc nhắc dựa vào trường `issues` trong kết quả `get_order` mà LLM tự đưa vào câu trả lời, nên có thể thay đổi theo model; cần đối chiếu cả `tool_events` / trace để thấy `high_value_pending` đã được trả về.
+
+**Case 3: Yêu cầu hoàn tiền**
+
+- Câu hỏi: `Cho tôi hoàn tiền đơn hàng có mã ORD-1001`
+- Dữ liệu: ORD-1001, `shipped`, `paid`, tổng 89.90, chưa hoàn đồng nào.
+- Mong đợi: **động tới tiền thì luôn cần người duyệt**. Khi LLM gọi `issue_refund`, policy trả `NEEDS_APPROVAL` và hiện thẻ "Cần nhân viên duyệt"; tool chưa chạy. Câu hỏi không nêu số tiền nên LLM có thể hỏi lại số tiền trước, trả lời xong thì mới hiện thẻ.
+  - **Duyệt**: hoàn tiền chạy, khách nhận thông báo; hoàn đủ 89.90 thì `payment_status` chuyển `refunded`.
+  - **Từ chối**: bắt buộc nhập lý do (ô trống thì không gửi được); khách nhận câu trả lời nêu **đầy đủ lý do** nhân viên nhập; đơn không đổi.
+
+**Case 4: Yêu cầu huỷ đơn thành công**
+
+- Câu hỏi: `Cho tôi hủy đơn order có mã ORD-1002`
+- Dữ liệu: ORD-1002, `processing` (đang chuẩn bị, chưa gửi hàng), `paid`, tổng 35.00.
+- Mong đợi: policy cho `cancel_order` mức **AUTO** vì chưa đẩy hàng đi, nên **huỷ ngay, không hiện thẻ duyệt**. Đơn chuyển sang `cancelled` và agent báo huỷ thành công. Huỷ đơn không tự hoàn tiền, `payment_status` vẫn là `paid`.
+
+**Case 5: Yêu cầu huỷ đơn không thành công, chuyển sang hoàn hàng**
+
+- Câu hỏi: `Cho tôi hủy đơn ORD-1004`
+- Dữ liệu: ORD-1004, `delivered` (đã giao), `paid`, tổng 249.00.
+- Mong đợi: policy trả **BLOCKED**, tool không chạy và đơn không đổi. Agent giải thích đơn đã giao nên không huỷ được và **đề nghị hoàn hàng**; UI hiện dialog "Bạn có muốn làm yêu cầu hoàn hàng cho đơn ORD-1004 không?".
+  - **Không**: dialog đóng, chat tiếp bình thường.
+  - **Có**: khách nhập video hiện trạng (mô phỏng) và lý do, gửi đi; hiện thẻ duyệt "Hoàn hàng" (ORD-1004, số tiền hoàn 249, video, lý do của khách). **Yêu cầu hoàn hàng cũng cần người duyệt.**
+    - **Duyệt**: đơn thành `returned`, hoàn đủ 249.00, khách nhận thông báo kèm số tiền.
+    - **Từ chối**: bắt buộc nhập lý do; khách nhận thông báo kèm lý do, đơn không đổi.
 
 ## 12. Giả định cần xác nhận
 

@@ -102,7 +102,7 @@ flowchart LR
 
 ### Luật phát hiện vấn đề (`detect_issues`)
 
-`get_order` trả kèm danh sách vấn đề của đơn để agent tham khảo: `payment_failed` (thanh toán lỗi), `missing_address` (thiếu địa chỉ), `late_delivery` (quá hạn giao mà chưa giao), `high_value_pending` (đơn đang xử lý trên 500).
+`get_order` trả kèm danh sách vấn đề của đơn để agent tham khảo: `payment_failed` (thanh toán lỗi), `missing_address` (thiếu địa chỉ), `late_delivery` (quá hạn giao mà chưa giao), `high_value_pending` (đơn có tổng trên 500, ở mọi trạng thái đơn).
 
 ## Key design decisions
 
