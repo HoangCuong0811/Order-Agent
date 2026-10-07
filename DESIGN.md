@@ -17,22 +17,32 @@ Chatbot hỗ trợ đơn hàng mô phỏng một sàn thương mại điện t�
 
 ## 2. Luồng hoạt động
 
+```mermaid
+flowchart LR
+    IN(["Tin nhắn<br/>của khách"]) --> LLM["Gọi LLM"]
+    LLM --> Q{"LLM trả về gì?"}
+
+    Q -- "Văn bản" --> OUT(["THOÁT: trả lời khách"])
+    Q -- "Tool call" --> POL{"Policy<br/>(code)"}
+
+    POL -- AUTO --> RUN["Chạy tool"]
+    POL -- BLOCKED --> BLK["Không chạy,<br/>trả lý do"]
+    POL -- NEEDS_APPROVAL --> WAIT(["TẠM THOÁT:<br/>chờ nhân viên duyệt"])
+
+    RUN --> RES["Kết quả tool"]
+    BLK --> RES
+    WAIT -. "duyệt: chạy tool<br/>từ chối: rejected_by_human" .-> RES
+
+    RES -- "quay lại LLM" --> LLM
+    RES -- "đã gọi LLM đủ 5 lần" --> ESC(["THOÁT: escalate<br/>cho nhân viên"])
 ```
-Trình duyệt ──HTTP──► FastAPI ──► SupportAgent (một đối tượng cho mỗi phiên)
-                                      │
-Validate input ──(rỗng / quá dài)──► 400, không gọi LLM
-      │
-Gemini (function calling) ──► đề xuất gọi tool
-      │
-Policy layer (code, quyết định trước khi tool chạy)
-      ├─ AUTO ──────────► (chỉ tra cứu và escalate) chạy tool, trả kết quả cho Gemini
-      ├─ NEEDS_APPROVAL ► (mọi huỷ đơn / hoàn tiền) lưu trạng thái lượt, trả status "pending_approval"
-      │                     ├─ POST /approval {approved: true}: kiểm tra lại policy, chạy tool, chạy tiếp
-      │                     └─ POST /approval {approved: false}: không chạy, báo Gemini "bị từ chối"
-      └─ BLOCKED ───────► không chạy, trả lý do cho Gemini (agent giải thích / escalate)
-      │
-Gemini trả lời: Tóm tắt · Đề xuất · Trạng thái
-```
+
+Cách đọc:
+
+- **Quay lại LLM**: mọi tool call (chạy, bị chặn, hoặc đã được duyệt/từ chối) đều cho ra một "kết quả tool". Kết quả này được đưa lại cho LLM để nó gọi thêm tool hoặc viết câu trả lời.
+- **Thoát vòng lặp**: LLM trả văn bản (câu trả lời cuối), hoặc đã gọi LLM đủ 5 lần thì hệ thống tự escalate.
+- **Tạm thoát**: tool `NEEDS_APPROVAL` dừng lượt và trả `status = pending_approval`. Sau khi nhân viên bấm Duyệt/Từ chối, lượt chạy tiếp và vào lại vòng lặp; bộ đếm 5 lần không bị reset.
+- **Lỗi** (API Gemini, mạng, quota...) ở bất kỳ bước nào: lịch sử về checkpoint, khách nhận thông báo lỗi, phiên dùng tiếp được.
 
 Vòng lặp tool-calling do **mình tự điều khiển** (tắt automatic function calling của SDK) để chèn policy layer vào giữa. Giới hạn tối đa 5 lượt gọi Gemini cho mỗi tin nhắn để tránh vòng lặp vô hạn.
 
