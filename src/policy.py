@@ -45,7 +45,7 @@ def _check_cancel(order: dict | None) -> Decision:
         return Decision(NEEDS_APPROVAL, "huỷ đơn luôn cần nhân viên duyệt")
     if status == "shipped":
         return Decision(NEEDS_APPROVAL, "huỷ đơn luôn cần nhân viên duyệt (đơn đã gửi đi)")
-    return Decision(BLOCKED, f"không thể huỷ đơn ở trạng thái '{status}'")
+    return Decision(BLOCKED, f"không thể huỷ đơn ở trạng thái '{status}', thay vào đó bạn cần thực hiện hoàn đơn")
 
 
 def _check_refund(args: dict, order: dict | None) -> Decision:
