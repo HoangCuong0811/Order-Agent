@@ -53,6 +53,15 @@
   .approval button:hover { opacity: .85; }
   .approval.done { border-color: var(--line); background: transparent; }
   .approval.done h4 { color: var(--muted); }
+  .approval .note { margin: 0 0 14px; font-size: 14px; overflow-wrap: anywhere; }
+  .approval .field { display: block; margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+  .approval input, .approval textarea {
+    display: block; width: 100%; margin-top: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 0;
+    background: var(--ivory); color: var(--ink); font: 14px/1.5 inherit; outline: none; resize: vertical;
+    max-height: none; overflow-y: auto;
+  }
+  .approval input:focus, .approval textarea:focus { border-color: var(--gold); }
+  .approval button:disabled { opacity: .35; cursor: default; }
 
   form { display: flex; align-items: flex-end; gap: 16px; padding: 14px 28px 22px; border-top: 1px solid var(--line); }
   textarea {
@@ -89,9 +98,10 @@ const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages"), inputEl = $("input"), sendEl = $("send");
 
 const WELCOME = "Xin chào, tôi có thể giúp bạn tra cứu đơn hàng, huỷ đơn hoặc hoàn tiền. Vui lòng cho tôi mã đơn hàng, ví dụ ORD-1001.";
-const TOOL_LABEL = { cancel_order: "Huỷ đơn", issue_refund: "Hoàn tiền" };
+const TOOL_LABEL = { cancel_order: "Huỷ đơn", issue_refund: "Hoàn tiền", return_order: "Hoàn hàng" };
 
-let sessionId = null, busy = false, pending = false;
+// pending: đang chờ nhân viên duyệt; offering: dialog mời hoàn hàng đang mở, khách chưa chọn.
+let sessionId = null, busy = false, pending = false, offering = false;
 
 function esc(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -106,8 +116,8 @@ function add(cls, html) {
   return d;
 }
 function refresh() {
-  inputEl.disabled = sendEl.disabled = busy || pending;
-  inputEl.placeholder = pending ? "Đang chờ nhân viên duyệt" : "Nhập tin nhắn";
+  inputEl.disabled = sendEl.disabled = busy || pending || offering;
+  inputEl.placeholder = pending ? "Đang chờ nhân viên duyệt" : offering ? "Hãy trả lời câu hỏi phía trên" : "Nhập tin nhắn";
   if (!inputEl.disabled) inputEl.focus();
 }
 
@@ -125,16 +135,80 @@ async function api(path, body) {
 
 function approvalCard(a) {
   const args = a.args || {};
+  const isReturn = a.tool === "return_order";
   const rows = [["Hành động", TOOL_LABEL[a.tool] || a.tool]];
   if (args.order_id) rows.push(["Mã đơn", args.order_id]);
-  if (args.amount !== undefined) rows.push(["Số tiền", args.amount]);
-  rows.push(["Lý do", a.reason]);
+  if (args.amount !== undefined) rows.push([isReturn ? "Số tiền hoàn" : "Số tiền", args.amount]);
+  if (isReturn) rows.push(["Video", args.video], ["Lý do của khách", args.reason]);
+  else rows.push(["Lý do", a.reason]);
   const card = add("approval", `<h4>Cần nhân viên duyệt</h4>
     <dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
     <div class="actions"><button class="yes" type="button">Duyệt</button><button type="button">Từ chối</button></div>`);
-  const [yes, no] = card.querySelectorAll("button");
+  const actions = card.querySelector(".actions");
+  const [yes, no] = actions.querySelectorAll("button");
   yes.onclick = () => decide(card, true);
-  no.onclick = () => decide(card, false);
+  no.onclick = () => rejectForm(card, actions);
+}
+
+// Bấm Từ chối: hiện ô nhập lý do (bắt buộc), chỉ gọi API khi bấm "Gửi từ chối".
+function rejectForm(card, actions) {
+  const box = document.createElement("div");
+  box.className = "reject-box";
+  box.innerHTML = `<label class="field">Lý do từ chối (sẽ gửi lại cho khách)
+      <textarea rows="3" maxlength="500" placeholder="Nhập lý do"></textarea></label>
+    <div class="actions"><button class="yes" type="button" disabled>Gửi từ chối</button><button type="button">Quay lại</button></div>`;
+  actions.style.display = "none";
+  card.appendChild(box);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  const text = box.querySelector("textarea");
+  const [submit, back] = box.querySelectorAll("button");
+  text.oninput = () => { submit.disabled = !text.value.trim(); };
+  text.focus();
+  submit.onclick = () => decide(card, false, text.value.trim());
+  back.onclick = () => { box.remove(); actions.style.display = ""; };
+}
+
+// Huỷ đơn bị chặn vì đã giao: hỏi khách có muốn làm yêu cầu hoàn hàng không.
+function offerCard(orderId) {
+  offering = true; refresh();
+  const card = add("approval", `<h4>Yêu cầu hoàn hàng</h4>
+    <p class="note">Bạn có muốn làm yêu cầu hoàn hàng cho đơn ${esc(orderId)} không?</p>
+    <div class="actions"><button class="yes" type="button">Có</button><button type="button">Không</button></div>`);
+  const [yes, no] = card.querySelectorAll("button");
+  yes.onclick = () => returnForm(card, orderId);
+  no.onclick = () => closeOffer(card, "Đã bỏ qua yêu cầu hoàn hàng");
+}
+
+function closeOffer(card, title) {
+  card.classList.add("done");
+  card.querySelector("h4").textContent = title;
+  card.querySelectorAll(".note, .actions, .field").forEach((e) => e.remove());
+  offering = false; refresh();
+}
+
+// Khách nhập video hiện trạng (mô phỏng, chỉ là chữ) và lý do hoàn, rồi gửi cho nhân viên.
+function returnForm(card, orderId) {
+  card.querySelector(".note").textContent = `Nhập thông tin để nhân viên xem xét hoàn hàng đơn ${orderId}.`;
+  card.querySelector(".actions").remove();
+  card.insertAdjacentHTML("beforeend", `
+    <label class="field">Video hiện trạng sản phẩm (mô phỏng, không upload)
+      <input type="text" maxlength="200" placeholder="Ví dụ: san-pham-loi.mp4"></label>
+    <label class="field">Lý do hoàn hàng
+      <textarea rows="3" maxlength="500" placeholder="Nhập lý do"></textarea></label>
+    <div class="actions"><button class="yes" type="button" disabled>Gửi</button><button type="button">Huỷ</button></div>`);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  const video = card.querySelector("input"), reason = card.querySelector("textarea");
+  const [submit, cancel] = card.querySelectorAll(".actions button");
+  const check = () => { submit.disabled = !(video.value.trim() && reason.value.trim()); };
+  video.oninput = check;
+  reason.oninput = check;
+  video.focus();
+  cancel.onclick = () => closeOffer(card, "Đã huỷ yêu cầu hoàn hàng");
+  submit.onclick = () => {
+    const body = { order_id: orderId, video: video.value.trim(), reason: reason.value.trim() };
+    closeOffer(card, "Đã gửi yêu cầu hoàn hàng");
+    turn(() => api(`/api/sessions/${sessionId}/return-requests`, body));
+  };
 }
 
 function render(r) {
@@ -143,6 +217,7 @@ function render(r) {
     approvalCard(r.approval);
   } else {
     add("msg bot", fmt(r.reply || ""));
+    if (r.offer_return) offerCard(r.offer_return);
   }
 }
 
@@ -166,26 +241,27 @@ async function turn(request) {
 
 function send() {
   const text = inputEl.value.trim();
-  if (!text || busy || pending || !sessionId) return;
+  if (!text || busy || pending || offering || !sessionId) return;
   add("msg user", esc(text));
   inputEl.value = "";
   grow();
   turn(() => api(`/api/sessions/${sessionId}/messages`, { message: text }));
 }
 
-function decide(card, approved) {
+function decide(card, approved, reason) {
   card.classList.add("done");
   card.querySelector("h4").textContent = approved ? "Đã duyệt" : "Đã từ chối";
-  card.querySelector(".actions").remove();
+  card.querySelectorAll(".actions, .reject-box").forEach((e) => e.remove());
+  if (!approved) card.insertAdjacentHTML("beforeend", `<p class="note">Lý do: ${esc(reason)}</p>`);
   pending = false;
-  turn(() => api(`/api/sessions/${sessionId}/approval`, { approved }));
+  turn(() => api(`/api/sessions/${sessionId}/approval`, approved ? { approved } : { approved, reason }));
 }
 
 async function newSession() { sessionId = (await api("/api/sessions")).session_id; }
 
 async function start() {
   messagesEl.innerHTML = "";
-  pending = false;
+  pending = false; offering = false;
   add("msg bot", esc(WELCOME));
   busy = true; refresh();
   try { await newSession(); } catch (e) { add("msg bot error", "Không kết nối được máy chủ: " + esc(e.message)); }

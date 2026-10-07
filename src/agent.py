@@ -21,6 +21,8 @@ MAX_TOOL_CALLS = 5  # giới hạn số lượt gọi Gemini cho mỗi tin nhắ
 REPLY = "reply"
 PENDING_APPROVAL = "pending_approval"
 
+RETURN_TOOL = "return_order"  # chỉ agent dùng (khách gửi qua UI), không khai báo cho LLM
+
 SYSTEM_PROMPT = """You are a customer support agent for an online shop.
 Reply in the same language the customer uses.
 
@@ -30,7 +32,11 @@ Rules:
 - To cancel or refund, call the tool. The system decides whether it runs automatically,
   needs human approval, or is blocked. Do not decide this yourself and do not argue the rules.
 - If a tool result says "blocked", explain the reason to the customer. Do not try workarounds.
-- If a tool result says "rejected_by_human", tell the customer the request was not approved.
+- If a tool result says "rejected_by_human", tell the customer the request was not approved and
+  give the staff member's reason from the "reason" field. Do not invent other reasons.
+- If a cancel is blocked because the order was already delivered and the reason mentions a return
+  request, explain that the order cannot be cancelled and suggest the customer submit a return request.
+  The system shows the customer a form for it; do not ask them to type the return details in chat.
 - For anything outside your tools or authority (delete account, complaints, compensation,
   legal issues), or if you are unsure, call escalate_to_human.
 
@@ -41,9 +47,37 @@ Trạng thái: <one of: ĐÃ XỬ LÝ | CHỜ DUYỆT | ĐÃ ESCALATE | CẦN TH
 
 ERROR_REPLY = "Xin lỗi, hệ thống đang gặp lỗi ({error}). Vui lòng thử lại sau."
 
+# Thông báo kết quả hoàn hàng: mẫu cố định, không qua LLM (luôn đủ lý do, vẫn kết thúc bằng 3 dòng chuẩn).
+RETURN_APPROVED_REPLY = (
+    "Yêu cầu hoàn hàng cho đơn {order_id} đã được duyệt. Đơn chuyển sang trạng thái \"returned\" "
+    "và số tiền {amount:.2f} sẽ được hoàn lại cho bạn.\n"
+    "Tóm tắt: khách yêu cầu hoàn hàng đơn {order_id}, lý do: {reason}\n"
+    "Đề xuất: không cần làm thêm gì, hãy liên hệ lại nếu cần hỗ trợ\n"
+    "Trạng thái: ĐÃ XỬ LÝ")
+RETURN_REJECTED_REPLY = (
+    "Yêu cầu hoàn hàng cho đơn {order_id} không được duyệt.\n"
+    "Lý do từ nhân viên: {staff_reason}\n"
+    "Tóm tắt: yêu cầu hoàn hàng đơn {order_id} bị từ chối\n"
+    "Đề xuất: liên hệ lại nếu bạn có thêm thông tin\n"
+    "Trạng thái: ĐÃ XỬ LÝ")
+RETURN_BLOCKED_REPLY = (
+    "Không thể thực hiện hoàn hàng cho đơn {order_id} vì dữ liệu đơn đã thay đổi: {reason}.\n"
+    "Tóm tắt: yêu cầu hoàn hàng đơn {order_id} không còn hợp lệ\n"
+    "Đề xuất: kiểm tra lại trạng thái đơn hoặc liên hệ nhân viên\n"
+    "Trạng thái: ĐÃ XỬ LÝ")
+
+
+def _one_line(text: str) -> str:
+    """Gộp khoảng trắng và xuống dòng, để lý do của người dùng không phá định dạng 3 dòng cuối của câu trả lời."""
+    return " ".join((text or "").split())
+
 
 class ApprovalStateError(Exception):
     """Gọi sai thứ tự: gửi tin khi đang chờ duyệt, hoặc duyệt khi không có yêu cầu nào."""
+
+
+class ReturnNotAllowed(Exception):
+    """Đơn không đủ điều kiện hoàn hàng (policy chặn); thông điệp là lý do để báo lại cho khách."""
 
 
 @dataclass
@@ -69,6 +103,7 @@ class TurnResult:
     reply: str | None = None
     approval: PendingApproval | None = None
     tool_events: list[ToolEvent] = field(default_factory=list)
+    offer_return: str | None = None  # mã đơn nếu UI nên mời khách làm yêu cầu hoàn hàng
 
 
 def make_client() -> genai.Client:
@@ -86,9 +121,12 @@ class SupportAgent:
         self.client = client
         self.trace = trace.Tracer(session_id)
         self.history: list[types.Content] = []
+        # Dữ liệu đơn riêng của phiên này (bản sao dữ liệu mẫu); tool chỉ sửa bản sao này.
+        self.orders = tools.new_session_orders()
+        self.tools = tools.make_tools(self.orders)
         self.config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            tools=list(tools.TOOLS.values()),
+            tools=list(self.tools.values()),
             # Tắt tự động gọi tool để mình chèn policy vào giữa.
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
@@ -100,6 +138,7 @@ class SupportAgent:
         self._results: list[types.Part] = []  # kết quả đã có, theo đúng thứ tự _calls
         self._pending: PendingApproval | None = None
         self._events: list[ToolEvent] = []
+        self._return_offer: str | None = None  # đặt khi huỷ đơn bị chặn vì đã giao, trả kèm câu trả lời cuối
         # Số liệu tổng kết của lượt, chỉ để in ở bước cuối.
         self._turn_started = 0.0
         self._pending_since = 0.0
@@ -116,10 +155,27 @@ class SupportAgent:
             raise ApprovalStateError("đang chờ nhân viên duyệt một yêu cầu")
         return self._guarded(lambda: self._start_turn(message))
 
-    def resolve_approval(self, approved: bool) -> TurnResult:
+    def resolve_approval(self, approved: bool, reason: str = "") -> TurnResult:
+        """Nhân viên quyết định yêu cầu đang chờ. Từ chối thì `reason` bắt buộc (API đã kiểm tra)."""
         if not self._pending:
             raise ApprovalStateError("không có yêu cầu nào đang chờ duyệt")
-        return self._guarded(lambda: self._resume(approved))
+        reason = _one_line(reason)
+        if not approved and not reason:
+            raise ValueError("từ chối phải kèm lý do")
+        if self._pending.tool == RETURN_TOOL:
+            return self._guarded(lambda: self._resume_return(approved, reason))
+        return self._guarded(lambda: self._resume(approved, reason))
+
+    def request_return(self, order_id: str, video: str, reason: str) -> TurnResult:
+        """Khách gửi yêu cầu hoàn hàng (từ form trên UI). Không qua LLM; luôn dừng chờ nhân viên duyệt."""
+        if self._pending:
+            raise ApprovalStateError("đang chờ nhân viên duyệt một yêu cầu")
+        order, _ = tools.find_order(self.orders, order_id)
+        decision = policy.evaluate_return(order)
+        if decision.level == policy.BLOCKED:
+            self.trace.note("YÊU CẦU HOÀN HÀNG BỊ TỪ CHỐI", f"{order_id}: {decision.reason}")
+            raise ReturnNotAllowed(decision.reason)
+        return self._guarded(lambda: self._start_return(order, decision, _one_line(video), _one_line(reason)))
 
     # --- điều khiển lượt hội thoại ---
 
@@ -144,6 +200,7 @@ class SupportAgent:
         ])
         self._checkpoint = len(self.history)
         self._step = 0
+        self._return_offer = None
         self._message = message
         self._turn_started = time.perf_counter()
         self._wait_seconds = 0.0
@@ -157,7 +214,7 @@ class SupportAgent:
             self._step += 1
             self.trace.step(f"GỌI LLM (lần {self._step}/{MAX_TOOL_CALLS})", [
                 f"Model: {model_name()}",
-                f"Tools khai báo cho LLM: {', '.join(tools.TOOLS)}",
+                f"Tools khai báo cho LLM: {', '.join(self.tools)}",
                 f"Gửi {len(self.history)} message lịch sử:",
                 *[f"  {line}" for line in trace.describe_contents(self.history)],
             ])
@@ -184,7 +241,8 @@ class SupportAgent:
             self.history.append(response.candidates[0].content)
 
             if not calls:
-                return self._reply(response.text or "Xin lỗi, tôi chưa có câu trả lời phù hợp.")
+                return self._reply(response.text or "Xin lỗi, tôi chưa có câu trả lời phù hợp.",
+                                   offer_return=self._return_offer)
 
             self._calls, self._results = list(calls), []
             paused = self._run_calls()
@@ -213,22 +271,23 @@ class SupportAgent:
         self._calls, self._results = [], []
         return None
 
-    def _resume(self, approved: bool) -> TurnResult:
+    def _resume(self, approved: bool, reason: str = "") -> TurnResult:
         pending, self._pending = self._pending, None
         waited = time.perf_counter() - self._pending_since
         self._wait_seconds += waited
         self.trace.step(f"NHÂN VIÊN {'ĐỒNG Ý' if approved else 'TỪ CHỐI'}", [
             f"Yêu cầu: {pending.tool}({trace.dump(pending.args)})",
             f"Thời gian chờ duyệt: {waited:.1f}s",
+            *([] if approved else [f"Lý do từ chối: {reason}"]),
             "→ kiểm tra lại policy trước khi chạy" if approved
-            else "→ không chạy tool; trả {status: rejected_by_human} cho LLM",
+            else "→ không chạy tool; trả {status: rejected_by_human, reason} cho LLM để báo khách",
         ])
         if not approved:
             self._event(pending.tool, pending.args, policy.NEEDS_APPROVAL, pending.reason, "rejected")
-            result = {"status": "rejected_by_human", "reason": "nhân viên không duyệt yêu cầu này"}
+            result = {"status": "rejected_by_human", "reason": reason}
         else:
-            # Dữ liệu có thể đã đổi từ lúc xin duyệt (phiên khác huỷ cùng đơn...), nên kiểm lại.
-            order, _ = tools.find_order(pending.args.get("order_id"))
+            # Kiểm lại cho chắc yêu cầu còn hợp lệ trên dữ liệu hiện tại của phiên.
+            order, _ = tools.find_order(self.orders, pending.args.get("order_id"))
             decision = policy.evaluate(pending.tool, pending.args, order)
             self.trace.step(f"POLICY KIỂM TRA LẠI TOOL {pending.tool}", [
                 f"Dữ liệu policy dựa vào: {self._order_snapshot(pending.args, order)}",
@@ -247,11 +306,83 @@ class SupportAgent:
         paused = self._run_calls()
         return paused or self._advance()
 
+    # --- hoàn hàng (không qua LLM) ---
+
+    def _start_return(self, order: dict, decision: policy.Decision, video: str, reason: str) -> TurnResult:
+        """Khách đã gửi form hoàn hàng và policy cho phép: dừng chờ nhân viên duyệt."""
+        self.trace.begin_turn()
+        self._checkpoint = len(self.history)
+        self._step = 0
+        self._return_offer = None
+        self._turn_started = time.perf_counter()
+        self._wait_seconds = 0.0
+        self._tool_runs = 0
+        args = {"order_id": order["order_id"], "amount": policy.refundable_amount(order),
+                "video": video, "reason": reason}
+        self.trace.step("KHÁCH GỬI YÊU CẦU HOÀN HÀNG", [
+            f"Dữ liệu policy dựa vào: {self._order_snapshot(args, order)}",
+            f"Video (mô phỏng, không upload): {video}",
+            f"Lý do hoàn: {reason}",
+            f"Quyết định: {decision.level} — {decision.reason}",
+        ])
+        self._pending = PendingApproval(RETURN_TOOL, args, decision.reason)
+        self._pending_since = time.perf_counter()
+        self._event(RETURN_TOOL, args, decision.level, decision.reason, "awaiting_approval")
+        self.trace.step("TẠM DỪNG CHỜ NHÂN VIÊN DUYỆT", [
+            f"Yêu cầu: {RETURN_TOOL}({trace.dump(args)})",
+            "→ API trả status=pending_approval; nhân viên gọi /approval, không qua LLM",
+        ])
+        return TurnResult(PENDING_APPROVAL, approval=self._pending, tool_events=self._events)
+
+    def _resume_return(self, approved: bool, reason: str) -> TurnResult:
+        pending, self._pending = self._pending, None
+        args = pending.args
+        order_id = args["order_id"]
+        waited = time.perf_counter() - self._pending_since
+        self._wait_seconds += waited
+        self.trace.step(f"NHÂN VIÊN {'ĐỒNG Ý' if approved else 'TỪ CHỐI'} HOÀN HÀNG", [
+            f"Yêu cầu: {RETURN_TOOL}({trace.dump(args)})",
+            f"Thời gian chờ duyệt: {waited:.1f}s",
+            *([] if approved else [f"Lý do từ chối: {reason}"]),
+            "→ kiểm tra lại policy trước khi chạy" if approved else "→ không chạy; báo khách bằng mẫu cố định",
+        ])
+        if not approved:
+            self._event(RETURN_TOOL, args, policy.NEEDS_APPROVAL, pending.reason, "rejected")
+            text = RETURN_REJECTED_REPLY.format(order_id=order_id, staff_reason=reason)
+        else:
+            # Kiểm lại cho chắc yêu cầu còn hợp lệ trên dữ liệu hiện tại của phiên.
+            order, _ = tools.find_order(self.orders, order_id)
+            decision = policy.evaluate_return(order)
+            self.trace.step("POLICY KIỂM TRA LẠI HOÀN HÀNG", [
+                f"Dữ liệu policy dựa vào: {self._order_snapshot(args, order)}",
+                f"Quyết định: {decision.level} — {decision.reason}",
+                "→ dữ liệu đã đổi, không chạy" if decision.level == policy.BLOCKED
+                else "→ vẫn hợp lệ, hoàn hàng và hoàn tiền vì nhân viên đã duyệt",
+            ])
+            if decision.level == policy.BLOCKED:
+                self._event(RETURN_TOOL, args, decision.level, decision.reason, "blocked")
+                text = RETURN_BLOCKED_REPLY.format(order_id=order_id, reason=decision.reason)
+            else:
+                result = tools.return_order(self.orders, order_id, args["video"], args["reason"])
+                self._tool_runs += 1
+                self._event(RETURN_TOOL, args, policy.NEEDS_APPROVAL, pending.reason, "approved")
+                self.trace.step(f"THỰC THI {RETURN_TOOL} (đã được nhân viên duyệt)", [
+                    f"Kết quả: {trace.dump(result)}",
+                ])
+                text = RETURN_APPROVED_REPLY.format(order_id=order_id, amount=result["refunded"],
+                                                    reason=args["reason"])
+        # Ghi vào lịch sử để LLM nắm ngữ cảnh nếu khách hỏi tiếp (trước đó là message role=model).
+        self.history.append(types.Content(role="user", parts=[types.Part(text=(
+            f"[Hệ thống] Khách đã gửi yêu cầu hoàn hàng cho đơn {order_id}. "
+            f"Video: {args['video']}. Lý do hoàn: {args['reason']}."))]))
+        self.history.append(types.Content(role="model", parts=[types.Part(text=text)]))
+        return self._reply(text)
+
     # --- thực thi tool ---
 
     def _handle_call(self, name: str, args: dict) -> dict | None:
         """Trả về kết quả tool để gửi lại cho Gemini, hoặc None nếu cần dừng chờ duyệt."""
-        if name not in tools.TOOLS:
+        if name not in self.tools:
             self.trace.step(f"LLM GỌI TOOL KHÔNG TỒN TẠI: {name}", [
                 f"Tham số: {trace.dump(args)}",
                 "→ không thực thi; trả {ok: false, error: unknown tool} cho LLM",
@@ -259,7 +390,7 @@ class SupportAgent:
             self._event(name, args, policy.BLOCKED, "tool không tồn tại", "blocked")
             return {"ok": False, "error": f"unknown tool: {name}"}
 
-        order, _ = tools.find_order(args.get("order_id"))
+        order, _ = tools.find_order(self.orders, args.get("order_id"))
         decision = policy.evaluate(name, args, order)
         next_action = {
             policy.AUTO: "→ chạy tool ngay, không cần duyệt",
@@ -275,6 +406,12 @@ class SupportAgent:
 
         if decision.level == policy.BLOCKED:
             self._event(name, args, decision.level, decision.reason, "blocked")
+            if policy.offers_return(name, decision, order):
+                self._return_offer = order["order_id"]
+                self.trace.step("MỜI KHÁCH LÀM YÊU CẦU HOÀN HÀNG", [
+                    f"Huỷ đơn {order['order_id']} bị chặn vì đơn đã giao, đơn đủ điều kiện hoàn hàng",
+                    "→ API trả offer_return cùng câu trả lời cuối, UI hiện dialog hỏi khách",
+                ])
             return {"status": "blocked", "reason": decision.reason}
         if decision.level == policy.NEEDS_APPROVAL:
             self._pending = PendingApproval(name, args, decision.reason)
@@ -293,7 +430,7 @@ class SupportAgent:
         outcome = "executed" if level == policy.AUTO else "approved"
         started = time.perf_counter()
         try:
-            result = tools.TOOLS[name](**args)
+            result = self.tools[name](**args)
         except TypeError:
             result, outcome = {"ok": False, "error": "invalid or missing arguments"}, "error"
         except Exception as e:
@@ -327,8 +464,9 @@ class SupportAgent:
     def _rollback(self) -> None:
         self.history = self.history[:self._checkpoint]
         self._calls, self._results, self._pending = [], [], None
+        self._return_offer = None
 
-    def _reply(self, text: str) -> TurnResult:
+    def _reply(self, text: str, offer_return: str | None = None) -> TurnResult:
         total = time.perf_counter() - self._turn_started
         self.trace.step("TRẢ LỜI KHÁCH", [
             "Câu trả lời:",
@@ -337,7 +475,7 @@ class SupportAgent:
             f"{self._step} lần gọi LLM · {self._tool_runs} lần thực thi tool",
         ])
         self.trace.end_turn()
-        return TurnResult(REPLY, reply=text, tool_events=self._events)
+        return TurnResult(REPLY, reply=text, tool_events=self._events, offer_return=offer_return)
 
     def _escalate(self, summary: str) -> TurnResult:
         summary = f"{summary} Tin nhắn khách: {self._message[:200]}"

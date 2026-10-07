@@ -61,7 +61,7 @@ Chạy từ thư mục gốc của project (nơi có `.env`) sau khi đã kích 
 - Giao diện chat: `http://127.0.0.1:8000/`
 - Tài liệu API tương tác (Swagger): `http://127.0.0.1:8000/docs`
 
-Trong giao diện, bạn vừa là khách hàng vừa đóng vai **nhân viên CSKH**: khi một yêu cầu cần duyệt, thẻ "Cần nhân viên duyệt" hiện ra với hai nút Duyệt / Từ chối. Nút "Mới" ở góc phải bắt đầu cuộc trò chuyện mới. Để nạp lại dữ liệu đơn mẫu (thử lại huỷ đơn / hoàn tiền từ đầu), gọi `POST /api/demo/reset-orders` (ví dụ qua `/docs`) hoặc khởi động lại server.
+Trong giao diện, bạn vừa là khách hàng vừa đóng vai **nhân viên CSKH**: khi một yêu cầu cần duyệt, thẻ "Cần nhân viên duyệt" hiện ra với hai nút Duyệt / Từ chối. Bấm Từ chối thì phải nhập lý do, lý do này được gửi lại cho khách. Khi huỷ đơn bị chặn vì đơn đã giao, một dialog mời bạn làm yêu cầu hoàn hàng (nhập video hiện trạng và lý do), rồi nhân viên duyệt hoặc từ chối. Nút "Mới" ở góc phải bắt đầu cuộc trò chuyện mới. Dữ liệu đơn là riêng của từng phiên: huỷ đơn, hoàn tiền, hoàn hàng chỉ ảnh hưởng phiên đang chat. Bấm "Mới" để bắt đầu lại từ dữ liệu mẫu gốc (thử lại từ đầu).
 
 ### Kịch bản gợi ý
 
@@ -70,10 +70,14 @@ Trong giao diện, bạn vừa là khách hàng vừa đóng vai **nhân viên C
 | 1 | `Đơn ORD-1001 của tôi đang ở đâu?` | Tra cứu và trả lời tự động |
 | 2 | `Huỷ đơn ORD-1002` (đang `processing`) | Hiện thẻ "Cần nhân viên duyệt"; chỉ huỷ khi bạn bấm Duyệt |
 | 3 | `Hoàn 200$ cho đơn ORD-1004` | Hiện thẻ "Cần nhân viên duyệt", bạn bấm Duyệt hoặc Từ chối |
-| 4 | `Huỷ đơn ORD-1005` (đã `delivered`) | Bị chặn, agent giải thích lý do |
+| 4 | `Huỷ đơn ORD-1005` (đã `delivered`) | Bị chặn, agent giải thích lý do và gợi ý hoàn hàng; dialog mời làm yêu cầu hoàn hàng hiện ra |
 | 5 | `Hoàn 30$ cho ORD-1005` | Vẫn hiện thẻ duyệt dù số tiền nhỏ: hoàn tiền luôn cần duyệt |
 | 6 | `Xoá tài khoản của tôi` | Agent escalate cho người |
 | 7 | `Đơn của tôi đâu?` / `ORD-9999` | Hỏi lại mã đơn / báo không tồn tại |
+| 8 | `Huỷ đơn ORD-1002`, bấm Từ chối | Phải nhập lý do mới gửi được; khách nhận câu trả lời nêu đúng lý do đó |
+| 9 | Như #4, chọn Không | Dialog đóng, chat tiếp bình thường |
+| 10 | Như #4, chọn Có, nhập video và lý do, rồi bấm Duyệt | Đơn thành `returned`, hoàn đủ tiền, khách nhận thông báo kèm số tiền |
+| 11 | Như #10 nhưng bấm Từ chối và nhập lý do | Đơn không đổi, khách nhận thông báo kèm lý do, kết thúc luồng hoàn hàng |
 
 Giao diện chỉ hiển thị câu trả lời và thẻ duyệt. Các tool agent đã gọi cùng quyết định của guardrail (`AUTO` / `NEEDS_APPROVAL` / `BLOCKED`) nằm trong trường `tool_events` của API, và được in từng bước ra console của backend (xem mục "Theo dõi từng bước của agent").
 
@@ -85,11 +89,11 @@ Mỗi cuộc trò chuyện là một **phiên** (session) có lịch sử riêng
 |---|---|---|
 | `POST` | `/api/sessions` | Tạo phiên mới, trả `{"session_id": "..."}` |
 | `POST` | `/api/sessions/{id}/messages` | Gửi tin nhắn của khách, body `{"message": "..."}` |
-| `POST` | `/api/sessions/{id}/approval` | Nhân viên duyệt hoặc từ chối, body `{"approved": true}` |
-| `POST` | `/api/demo/reset-orders` | Nạp lại dữ liệu đơn mẫu |
+| `POST` | `/api/sessions/{id}/approval` | Nhân viên duyệt hoặc từ chối, body `{"approved": true}` hoặc `{"approved": false, "reason": "..."}` (từ chối bắt buộc có `reason`, tối đa 500 ký tự) |
+| `POST` | `/api/sessions/{id}/return-requests` | Khách gửi yêu cầu hoàn hàng, body `{"order_id": "ORD-1005", "video": "...", "reason": "..."}`; trả `pending_approval` để nhân viên duyệt qua `approval` |
 | `GET` | `/api/health` | Kiểm tra server và model đang dùng |
 
-`messages` và `approval` đều trả cùng một dạng kết quả:
+`messages`, `approval` và `return-requests` đều trả cùng một dạng kết quả:
 
 ```json
 {
@@ -98,6 +102,7 @@ Mỗi cuộc trò chuyện là một **phiên** (session) có lịch sử riêng
   "body": "câu trả lời bỏ 3 dòng cuối",
   "summary": "...", "suggestion": "...", "case_status": "ĐÃ XỬ LÝ",
   "approval": null,
+  "offer_return": null,
   "tool_events": [
     {"tool": "cancel_order", "args": {"order_id": "ORD-1002"}, "level": "NEEDS_APPROVAL",
      "reason": "huỷ đơn luôn cần nhân viên duyệt", "outcome": "approved"}
@@ -105,9 +110,9 @@ Mỗi cuộc trò chuyện là một **phiên** (session) có lịch sử riêng
 }
 ```
 
-`status` là `reply` (agent đã trả lời xong) hoặc `pending_approval` (lượt hội thoại đang tạm dừng chờ duyệt, khi đó `approval` chứa hành động cần duyệt và `reply` là `null`). Gọi `approval` để chạy tiếp; trong lúc chờ duyệt, gửi thêm tin nhắn vào phiên đó sẽ nhận `409`.
+`status` là `reply` (agent đã trả lời xong) hoặc `pending_approval` (lượt hội thoại đang tạm dừng chờ duyệt, khi đó `approval` chứa hành động cần duyệt và `reply` là `null`). Gọi `approval` để chạy tiếp; trong lúc chờ duyệt, gửi thêm tin nhắn vào phiên đó sẽ nhận `409`. `offer_return` là mã đơn khi UI nên mời khách làm yêu cầu hoàn hàng (huỷ đơn bị chặn vì đơn đã giao và đơn đủ điều kiện hoàn hàng), ngược lại `null`. Với yêu cầu hoàn hàng, `approval.tool` là `return_order` và `approval.args` gồm `order_id`, `amount` (số tiền sẽ hoàn), `video`, `reason`.
 
-Mã lỗi: `400` tin nhắn rỗng hoặc dài quá 1000 ký tự, `404` phiên không tồn tại (kể cả sau khi server khởi động lại), `409` sai thứ tự thao tác hoặc phiên đang bận.
+Mã lỗi: `400` tin nhắn rỗng hoặc dài quá 1000 ký tự, từ chối duyệt mà thiếu lý do, yêu cầu hoàn hàng thiếu video / lý do hoặc đơn không đủ điều kiện hoàn hàng, `404` phiên không tồn tại (kể cả sau khi server khởi động lại), `409` sai thứ tự thao tác hoặc phiên đang bận.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/sessions
@@ -126,7 +131,8 @@ Mỗi lần có tin nhắn, backend **in ra console** (nơi bạn chạy `python
 | `LLM TRẢ VỀ` | Thời gian, token, các phần LLM trả về (`function_call` hoặc `text`), và kết luận LLM gọi tool hay trả lời cuối |
 | `POLICY KIỂM TRA TOOL` | Tham số LLM đề xuất, dữ liệu đơn policy dựa vào, quyết định `AUTO` / `NEEDS_APPROVAL` / `BLOCKED` và hệ quả |
 | `TẠM DỪNG CHỜ NHÂN VIÊN DUYỆT` | Yêu cầu đang chờ duyệt (chỉ khi `NEEDS_APPROVAL`) |
-| `NHÂN VIÊN ĐỒNG Ý / TỪ CHỐI` | Quyết định, thời gian chờ, kiểm tra lại policy |
+| `NHÂN VIÊN ĐỒNG Ý / TỪ CHỐI` | Quyết định, lý do từ chối, thời gian chờ, kiểm tra lại policy |
+| `KHÁCH GỬI YÊU CẦU HOÀN HÀNG` | Mã đơn, video, lý do, kết quả policy kiểm tra hoàn hàng (chỉ khi khách gửi từ dialog) |
 | `THỰC THI TOOL` | Tham số, kết quả tool trả về, thời gian chạy |
 | `GỬI KẾT QUẢ TOOL LẠI CHO LLM` | Kết quả từng tool được thêm vào lịch sử để LLM tổng hợp |
 | `TRẢ LỜI KHÁCH` | Câu trả lời cuối, tổng thời gian, số lần gọi LLM và tool |
@@ -172,19 +178,23 @@ Policy layer (src/policy.py, thuần code)
       ├─ NEEDS_APPROVAL ► (mọi huỷ đơn / hoàn tiền) tạm dừng lượt, API trả status "pending_approval"
       │                     │  (nhân viên gọi /approval)
       │                     ├─ duyệt: kiểm tra lại policy, chạy tool, chạy tiếp
-      │                     └─ từ chối: không chạy, báo Gemini "rejected_by_human"
+      │                     └─ từ chối (kèm lý do): không chạy, báo Gemini "rejected_by_human" + lý do
       └─ BLOCKED ───────► không chạy, trả lý do cho Gemini
       │
 Gemini trả lời: Tóm tắt · Đề xuất · Trạng thái
+
+Luồng hoàn hàng (không qua Gemini): huỷ đơn `delivered` bị BLOCKED → dialog mời hoàn hàng → khách nhập video + lý do
+      → POST /return-requests → policy → chờ nhân viên duyệt (/approval) → đổi đơn sang `returned` + hoàn đủ tiền,
+        hoặc từ chối kèm lý do → báo khách bằng mẫu cố định. Chi tiết trong DESIGN.md mục 2.
 ```
 
 ```
 ├── src/
 │   ├── main.py          # khởi động server (uvicorn)
 │   ├── api.py           # REST API, quản lý phiên, phục vụ UI
-│   ├── agent.py         # vòng lặp Gemini + policy + tạm dừng/tiếp tục khi chờ duyệt
+│   ├── agent.py         # vòng lặp Gemini + policy + tạm dừng/tiếp tục khi chờ duyệt + luồng hoàn hàng
 │   ├── policy.py        # guardrail (evaluate) và luật phát hiện vấn đề (detect_issues)
-│   ├── tools.py         # get_order, cancel_order, issue_refund, escalate_to_human
+│   ├── tools.py         # get_order, cancel_order, issue_refund, escalate_to_human, return_order (nội bộ)
 │   ├── agent_trace.py   # in từng bước của agent ra console backend
 │   └── static/index.html  # giao diện chat
 ├── data/orders.json     # dữ liệu đơn hàng mẫu (9 đơn)
@@ -200,12 +210,14 @@ Gemini trả lời: Tóm tắt · Đề xuất · Trạng thái
 |---|---|---|
 | `get_order` | Chỉ đọc | AUTO |
 | `cancel_order` | Đơn `processing` hoặc `shipped` | **NEEDS_APPROVAL** (luôn cần duyệt) |
-| | Đơn `delivered` / `cancelled` (hoặc mã đơn sai) | BLOCKED |
+| | Đơn `delivered` / `cancelled` / `returned` (hoặc mã đơn sai) | BLOCKED (đơn `delivered` đủ điều kiện thì lý do kèm gợi ý hoàn hàng) |
 | `issue_refund` | Đơn đã thanh toán, số tiền hợp lệ và không vượt số còn hoàn được | **NEEDS_APPROVAL** (luôn cần duyệt, bất kể số tiền) |
 | | Chưa thanh toán / số tiền ≤ 0 / vượt số tiền còn hoàn được / mã đơn sai | BLOCKED |
 | `escalate_to_human` | Luôn cho phép | AUTO |
+| `return_order` (nội bộ, không khai báo cho LLM) | Đơn `delivered`, đã thanh toán, còn số tiền hoàn được | **NEEDS_APPROVAL** (luôn cần duyệt) |
+| | Đơn không `delivered`, chưa thanh toán, đã hoàn hết, hoặc mã đơn sai | BLOCKED |
 
-**Quy tắc cốt lõi: không có đường tự động cho thao tác động tới tiền.** Huỷ đơn và hoàn tiền luôn qua nhân viên duyệt, không phụ thuộc trạng thái đơn hay số tiền. Chỉ tra cứu và escalate chạy tự động. `BLOCKED` áp dụng cho yêu cầu không thể thực hiện, nên không hỏi nhân viên.
+**Quy tắc cốt lõi: không có đường tự động cho thao tác động tới tiền.** Huỷ đơn, hoàn tiền và hoàn hàng (kéo theo hoàn tiền) luôn qua nhân viên duyệt, không phụ thuộc trạng thái đơn hay số tiền. Chỉ tra cứu và escalate chạy tự động. `BLOCKED` áp dụng cho yêu cầu không thể thực hiện, nên không hỏi nhân viên.
 
 ### Luật phát hiện vấn đề (`detect_issues`)
 
@@ -215,9 +227,9 @@ Gemini trả lời: Tóm tắt · Đề xuất · Trạng thái
 
 1. **Guardrail nằm trong code, không nằm trong prompt.** Prompt chỉ dặn Gemini cách cư xử, nhưng quyền chạy một hành động do `src/policy.py` quyết định dựa trên dữ liệu thật của đơn. Gemini không thể lách bằng cách diễn đạt khác, và khách nói gì cũng không đổi được kết quả.
 2. **Tự điều khiển vòng lặp tool-calling.** Tắt automatic function calling của SDK để chèn policy và bước duyệt vào giữa "Gemini đề xuất" và "tool chạy".
-3. **Duyệt bất đồng bộ qua API.** Agent không chặn thread để chờ người. Khi cần duyệt, trạng thái lượt (các tool call đang xử lý, kết quả đã có) được giữ trong phiên và `resolve_approval` chạy tiếp đúng từ chỗ dừng. Khi duyệt, policy được **đánh giá lại** vì dữ liệu có thể đã đổi trong lúc chờ (ví dụ phiên khác đã huỷ cùng đơn).
+3. **Duyệt bất đồng bộ qua API.** Agent không chặn thread để chờ người. Khi cần duyệt, trạng thái lượt (các tool call đang xử lý, kết quả đã có) được giữ trong phiên và `resolve_approval` chạy tiếp đúng từ chỗ dừng. Khi duyệt, policy vẫn được **đánh giá lại** trên dữ liệu hiện tại để chắc chắn yêu cầu còn hợp lệ.
 4. **Mặc định chặn (fail closed).** Tool lạ, tham số sai hoặc không đọc được thì bị `BLOCKED`. Không có quyết định duyệt thì tool không chạy.
-5. **Mọi thao tác động tới tiền luôn cần người duyệt.** Huỷ đơn và hoàn tiền không có ngưỡng và không có đường tự động. Chỉ tra cứu và escalate tự chạy. Tổng tiền đã hoàn của đơn vẫn được tính để chặn hoàn vượt số tiền của đơn.
+5. **Mọi thao tác động tới tiền luôn cần người duyệt.** Huỷ đơn, hoàn tiền và hoàn hàng không có ngưỡng và không có đường tự động. Chỉ tra cứu và escalate tự chạy. Tổng tiền đã hoàn của đơn vẫn được tính để chặn hoàn vượt số tiền của đơn.
 6. **Mỗi phiên xử lý một lượt tại một thời điểm.** Gửi tin khi phiên đang bận hoặc đang chờ duyệt trả `409`, để lịch sử hội thoại không bị ghi chồng.
 7. **Giới hạn 5 lượt gọi Gemini mỗi tin nhắn.** Vượt thì dừng và tự escalate để tránh vòng lặp vô hạn.
 8. **Lỗi không làm hỏng phiên.** Lỗi API được bắt, trả thông báo thân thiện, và lịch sử hội thoại được khôi phục về trước lượt lỗi.
@@ -225,10 +237,11 @@ Gemini trả lời: Tóm tắt · Đề xuất · Trạng thái
 
 ## Known limitations
 
-- **Không xác thực khách hàng.** Ai biết mã đơn đều xem và thao tác được đơn đó, và ai cũng gọi được `/approval`, `/api/demo/reset-orders`. Bản thật cần đăng nhập khách hàng, và endpoint duyệt phải dành riêng cho nhân viên đã xác thực.
-- **Dữ liệu và phiên chỉ lưu trong bộ nhớ.** Huỷ đơn, hoàn tiền, lịch sử hội thoại và yêu cầu đang chờ duyệt mất khi server khởi động lại. Dữ liệu đơn dùng chung cho mọi phiên. Server giữ tối đa 200 phiên gần nhất, chạy một process.
+- **Không xác thực khách hàng.** Ai biết mã đơn đều xem và thao tác được đơn đó, và ai cũng gọi được `/approval`. Bản thật cần đăng nhập khách hàng, và endpoint duyệt phải dành riêng cho nhân viên đã xác thực.
+- **Dữ liệu và phiên chỉ lưu trong bộ nhớ.** Huỷ đơn, hoàn tiền, lịch sử hội thoại và yêu cầu đang chờ duyệt mất khi server khởi động lại. Mỗi phiên có bản sao dữ liệu đơn riêng, thay đổi không ảnh hưởng phiên khác. Server giữ tối đa 200 phiên gần nhất, chạy một process.
 - **Hoàn tiền và escalate chỉ giả lập.** Không gọi cổng thanh toán hay hệ thống ticket thật; `escalate_to_human` chỉ in ra console.
 - **Huỷ đơn không tự hoàn tiền.** Hoàn tiền là một thao tác riêng, đi qua guardrail riêng.
+- **Hoàn hàng chỉ giả lập.** Video chỉ là thông tin nhập tay (không upload, không kiểm tra). Duyệt nghĩa là đổi đơn sang `returned` và hoàn toàn bộ số tiền còn lại; không hoàn một phần, không có thời hạn hoàn hàng. Thông báo kết quả dùng mẫu cố định, không qua Gemini.
 - **Lượt lỗi không hoàn tác tool đã chạy.** Nếu một tool đã thực thi rồi Gemini mới lỗi, lịch sử được khôi phục nhưng thay đổi dữ liệu vẫn còn. Tổng tiền đã hoàn được tính vào guardrail nên không thể hoàn vượt số tiền của đơn, nhưng khách có thể phải hỏi lại.
 - **Phụ thuộc vào Gemini.** Cần mạng và API key hợp lệ; chất lượng câu trả lời và việc tuân thủ định dạng 3 dòng cuối phụ thuộc model. Guardrail vẫn an toàn dù model trả lời sai định dạng.
 - **Luật là hằng số** trong `src/policy.py` (ngưỡng gắn cờ đơn giá trị cao 500, chỉ để cảnh báo), chưa cấu hình được từ ngoài.

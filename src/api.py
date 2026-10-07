@@ -24,6 +24,9 @@ import tools
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_MESSAGE_LENGTH = 1000
+MAX_REJECT_REASON = 500  # lý do nhân viên từ chối
+MAX_RETURN_VIDEO = 200  # tên/đường dẫn video của yêu cầu hoàn hàng (mô phỏng)
+MAX_RETURN_REASON = 500
 MAX_SESSIONS = 200  # vượt quá thì bỏ phiên cũ nhất, để bộ nhớ không phình mãi
 
 
@@ -45,6 +48,13 @@ class MessageIn(BaseModel):
 
 class ApprovalIn(BaseModel):
     approved: bool
+    reason: str | None = None  # bắt buộc khi approved = false
+
+
+class ReturnRequestIn(BaseModel):
+    order_id: str
+    video: str
+    reason: str
 
 
 class ToolEventOut(BaseModel):
@@ -69,6 +79,7 @@ class ChatOut(BaseModel):
     suggestion: str | None = None
     case_status: str | None = None
     approval: ApprovalOut | None = None
+    offer_return: str | None = None  # mã đơn nếu UI nên mời khách làm yêu cầu hoàn hàng
     tool_events: list[ToolEventOut] = []
 
 
@@ -99,6 +110,7 @@ def to_response(result: agent.TurnResult) -> ChatOut:
         "status": result.status,
         "tool_events": [asdict(e) for e in result.tool_events],
         "approval": asdict(result.approval) if result.approval else None,
+        "offer_return": result.offer_return,
     }
     if result.reply is not None:
         out["reply"] = result.reply
@@ -115,13 +127,22 @@ def validate_message(text: str) -> str | None:
     return None
 
 
+def validate_text(label: str, text: str, max_length: int) -> str | None:
+    """Trả về thông báo lỗi nếu trường văn bản trống hoặc quá dài, ngược lại None."""
+    if not text.strip():
+        return f"{label} đang trống, vui lòng nhập."
+    if len(text) > max_length:
+        return f"{label} quá dài ({len(text)} ký tự, tối đa {max_length})."
+    return None
+
+
 # --- app ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tools.load_orders()
     app.state.client = agent.make_client()  # thiếu GEMINI_API_KEY thì lỗi ngay lúc khởi động
-    trace.event(f"SERVER SẴN SÀNG: model={agent.model_name()}, {len(tools.ORDERS)} đơn hàng mẫu")
+    trace.event(f"SERVER SẴN SÀNG: model={agent.model_name()}, {len(tools.TEMPLATE)} đơn hàng mẫu")
     yield
 
 
@@ -146,6 +167,8 @@ def _run_turn(session_id: str, run) -> ChatOut:
     except agent.ApprovalStateError as e:
         session.agent.trace.note("YÊU CẦU BỊ TỪ CHỐI (409)", str(e))
         raise HTTPException(409, f"Không thực hiện được: {e}.")
+    except agent.ReturnNotAllowed as e:
+        raise HTTPException(400, f"Không thể hoàn hàng: {e}.")
     finally:
         session.lock.release()
 
@@ -178,14 +201,23 @@ def send_message(session_id: str, body: MessageIn) -> ChatOut:
 
 @app.post("/api/sessions/{session_id}/approval", response_model=ChatOut)
 def resolve_approval(session_id: str, body: ApprovalIn) -> ChatOut:
-    return _run_turn(session_id, lambda a: a.resolve_approval(body.approved))
+    reason = body.reason or ""
+    if not body.approved:  # từ chối bắt buộc có lý do để gửi lại cho khách
+        error = validate_text("Lý do từ chối", reason, MAX_REJECT_REASON)
+        if error:
+            trace.event(f"[{session_id[:8]}] TỪ CHỐI KHÔNG CÓ LÝ DO HỢP LỆ (400), lượt vẫn chờ duyệt", error)
+            raise HTTPException(400, error)
+    return _run_turn(session_id, lambda a: a.resolve_approval(body.approved, reason))
 
 
-@app.post("/api/demo/reset-orders")
-def reset_orders() -> dict:
-    """Nạp lại dữ liệu đơn mẫu (huỷ đơn / hoàn tiền trước đó bị xoá), để demo lại từ đầu."""
-    tools.load_orders()
-    return {"status": "ok", "orders": len(tools.ORDERS)}
+@app.post("/api/sessions/{session_id}/return-requests", response_model=ChatOut)
+def create_return_request(session_id: str, body: ReturnRequestIn) -> ChatOut:
+    error = (validate_text("Video hiện trạng", body.video, MAX_RETURN_VIDEO)
+             or validate_text("Lý do hoàn hàng", body.reason, MAX_RETURN_REASON))
+    if error:
+        trace.event(f"[{session_id[:8]}] YÊU CẦU HOÀN HÀNG KHÔNG HỢP LỆ (400)", error)
+        raise HTTPException(400, error)
+    return _run_turn(session_id, lambda a: a.request_return(body.order_id, body.video, body.reason))
 
 
 @app.get("/", include_in_schema=False)

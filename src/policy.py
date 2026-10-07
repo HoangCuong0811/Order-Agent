@@ -42,10 +42,37 @@ def _check_cancel(order: dict | None) -> Decision:
         return Decision(BLOCKED, "mã đơn không hợp lệ hoặc không tồn tại")
     status = order["status"]
     if status == "processing":
-        return Decision(NEEDS_APPROVAL, "huỷ đơn luôn cần nhân viên duyệt")
+        return Decision(AUTO, "Đơn hàng này chỉ đang chuẩn bị, có thể tự động hủy")
     if status == "shipped":
         return Decision(NEEDS_APPROVAL, "huỷ đơn luôn cần nhân viên duyệt (đơn đã gửi đi)")
-    return Decision(BLOCKED, f"không thể huỷ đơn ở trạng thái '{status}', thay vào đó bạn cần thực hiện hoàn đơn")
+    if status == "delivered" and evaluate_return(order).level == NEEDS_APPROVAL:
+        return Decision(BLOCKED, "không thể huỷ đơn đã giao; khách có thể làm yêu cầu hoàn hàng thay thế "
+                                 "(hệ thống sẽ hiện form để khách nhập)")
+    return Decision(BLOCKED, f"không thể huỷ đơn ở trạng thái '{status}'")
+
+
+def refundable_amount(order: dict) -> float:
+    """Số tiền còn hoàn được của đơn (tổng trừ phần đã hoàn)."""
+    return round(order["total"] - order["refunded_amount"], 2)
+
+
+def evaluate_return(order: dict | None) -> Decision:
+    """Quyết định yêu cầu hoàn hàng của khách. Không phải tool của LLM nên không đi qua `evaluate`."""
+    if order is None:
+        return Decision(BLOCKED, "mã đơn không hợp lệ hoặc không tồn tại")
+    if order["status"] != "delivered":
+        return Decision(BLOCKED, f"chỉ đơn đã giao mới hoàn hàng được, đơn này đang ở trạng thái '{order['status']}'")
+    if order["payment_status"] != "paid":
+        return Decision(BLOCKED, f"đơn có trạng thái thanh toán '{order['payment_status']}', không thể hoàn tiền")
+    if refundable_amount(order) <= 0:
+        return Decision(BLOCKED, "đơn đã được hoàn hết tiền")
+    return Decision(NEEDS_APPROVAL, "hoàn hàng (kéo theo hoàn tiền) luôn cần nhân viên duyệt")
+
+
+def offers_return(tool_name: str, decision: Decision, order: dict | None) -> bool:
+    """Huỷ đơn bị chặn vì đơn đã giao, và đơn đủ điều kiện hoàn hàng: UI nên mời khách làm yêu cầu hoàn hàng."""
+    return (tool_name == "cancel_order" and decision.level == BLOCKED and order is not None
+            and order["status"] == "delivered" and evaluate_return(order).level == NEEDS_APPROVAL)
 
 
 def _check_refund(args: dict, order: dict | None) -> Decision:
@@ -71,7 +98,7 @@ def detect_issues(order: dict) -> list[str]:
     """Trả về danh sách vấn đề của một đơn (rỗng nếu không có)."""
     issues = []
     status = order["status"]
-    if status == "cancelled":
+    if status in ("cancelled", "returned"):
         return issues
 
     if order["payment_status"] == "failed":
