@@ -1,4 +1,8 @@
-"""Guardrails và luật phát hiện vấn đề. Thuần code, không dùng LLM."""
+"""Guardrails và luật phát hiện vấn đề. Thuần code, không dùng LLM.
+
+Quy tắc cốt lõi: thao tác động tới tiền (huỷ đơn, hoàn tiền) KHÔNG có đường tự động. Chúng luôn cần
+nhân viên duyệt, bất kể trạng thái đơn hay số tiền. BLOCKED chỉ dành cho yêu cầu không thể thực hiện.
+"""
 
 import math
 from dataclasses import dataclass
@@ -8,7 +12,6 @@ AUTO = "AUTO"
 NEEDS_APPROVAL = "NEEDS_APPROVAL"
 BLOCKED = "BLOCKED"
 
-REFUND_AUTO_LIMIT = 50.0  # tổng tiền hoàn tự động tối đa cho một đơn
 HIGH_VALUE_THRESHOLD = 500.0  # đơn đang xử lý có giá trị trên mức này cần kiểm tra thủ công
 
 # Ngày cố định để dữ liệu mẫu cho kết quả giống nhau mỗi lần chạy demo.
@@ -24,7 +27,7 @@ class Decision:
 
 
 def evaluate(tool_name: str, args: dict, order: dict | None) -> Decision:
-    """Quyết định một lần gọi tool được chạy tự động, cần duyệt hay bị chặn."""
+    """Quyết định một lần gọi tool: chạy tự động (chỉ tra cứu / escalate), cần duyệt, hay bị chặn."""
     if tool_name == "cancel_order":
         return _check_cancel(order)
     if tool_name == "issue_refund":
@@ -39,9 +42,9 @@ def _check_cancel(order: dict | None) -> Decision:
         return Decision(BLOCKED, "mã đơn không hợp lệ hoặc không tồn tại")
     status = order["status"]
     if status == "processing":
-        return Decision(AUTO, "đơn chưa gửi đi")
+        return Decision(NEEDS_APPROVAL, "huỷ đơn luôn cần nhân viên duyệt")
     if status == "shipped":
-        return Decision(NEEDS_APPROVAL, "đơn đã gửi đi, huỷ cần nhân viên duyệt")
+        return Decision(NEEDS_APPROVAL, "huỷ đơn luôn cần nhân viên duyệt (đơn đã gửi đi)")
     return Decision(BLOCKED, f"không thể huỷ đơn ở trạng thái '{status}'")
 
 
@@ -61,10 +64,7 @@ def _check_refund(args: dict, order: dict | None) -> Decision:
     if amount + already > order["total"] + 1e-9:
         remaining = order["total"] - already
         return Decision(BLOCKED, f"vượt quá số tiền còn có thể hoàn ({remaining:.2f})")
-    # Tính cả số đã hoàn trước đó để không lách luật bằng cách chia nhỏ nhiều lần.
-    if amount + already <= REFUND_AUTO_LIMIT:
-        return Decision(AUTO, f"tổng hoàn tiền không quá {REFUND_AUTO_LIMIT:.0f}")
-    return Decision(NEEDS_APPROVAL, f"tổng hoàn tiền vượt {REFUND_AUTO_LIMIT:.0f}, cần nhân viên duyệt")
+    return Decision(NEEDS_APPROVAL, "hoàn tiền luôn cần nhân viên duyệt, bất kể số tiền")
 
 
 def detect_issues(order: dict) -> list[str]:

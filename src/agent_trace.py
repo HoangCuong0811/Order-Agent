@@ -1,44 +1,124 @@
-"""Ghi vết các bước agent ra file để xem lại: LLM đề xuất gì, policy quyết định ra sao, tool trả về gì."""
+"""In từng bước chạy của agent ra console của backend, để xem lại đường đi của mỗi lượt hội thoại.
+
+Một lượt được ghi đúng thứ tự hệ thống chạy:
+nhận câu hỏi -> gọi LLM -> LLM trả về (tool call hoặc câu trả lời) -> policy kiểm tra -> thực thi tool
+-> gửi kết quả tool lại cho LLM -> gọi LLM tổng hợp -> trả lời khách.
+
+Dòng đầu của mỗi bước có dạng `[giờ] [phiên Lượt #số-bước +giây-từ-đầu-lượt] TIÊU ĐỀ`, các dòng sau
+là chi tiết. Không ghi file; xem trong log của backend.
+"""
 
 import json
-import os
+import threading
+import time
 from datetime import datetime
-from pathlib import Path
 
-LOG_FILE = Path(os.getenv("AGENT_TRACE_FILE") or Path(__file__).resolve().parent.parent / "logs" / "agent_trace.log")
+VALUE_LIMIT = 1500  # cắt giá trị dài để mỗi bước đọc được trong một màn hình
+HISTORY_LINES = 6  # số message gần nhất của lịch sử được liệt kê khi gọi LLM
 
-
-def _dump(value) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str)
+_print_lock = threading.Lock()  # nhiều phiên chạy song song, mỗi bước phải được in liền một khối
 
 
-def log(title: str, body=None) -> None:
-    """Ghi một dòng trace. Lỗi ghi file không bao giờ được làm hỏng agent."""
-    line = f"[{datetime.now():%H:%M:%S}] {title}"
-    if body is not None:
-        line += f"\n    {body if isinstance(body, str) else _dump(body)}"
+def _now() -> str:
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+def _clip(text: str, limit: int = VALUE_LIMIT) -> str:
+    return text if len(text) <= limit else f"{text[:limit]}... (cắt, dài {len(text)} ký tự)"
+
+
+def dump(value, limit: int = VALUE_LIMIT) -> str:
+    return _clip(json.dumps(value, ensure_ascii=False, default=str), limit)
+
+
+def _format_body(body) -> str:
+    """body là chuỗi, danh sách dòng, hoặc giá trị bất kỳ (ghi dưới dạng JSON). Mỗi dòng thụt vào 4 khoảng trắng."""
+    if body is None:
+        return ""
+    items = body if isinstance(body, list) else [body]
+    lines = []
+    for item in items:
+        text = item if isinstance(item, str) else dump(item)
+        lines.extend(f"    {line}" for line in text.splitlines() or [""])
+    return "\n".join(lines) + "\n"
+
+
+def _write(text: str) -> None:
     try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass
+        with _print_lock:
+            print(text, end="", flush=True)
+    except (OSError, UnicodeEncodeError):
+        pass  # console lỗi không bao giờ được làm hỏng agent
 
 
-def start_session(mode: str, model: str) -> None:
-    log(f"{'=' * 20} PHIÊN MỚI ({mode}, model={model}) {'=' * 20}")
+def event(title: str, body=None) -> None:
+    """Sự kiện cấp server, không thuộc lượt hội thoại nào (khởi động, tin nhắn bị API từ chối...)."""
+    _write(f"[{_now()}] {title}\n{_format_body(body)}")
 
 
-def log_llm_call(step: int, model: str, seconds: float, response) -> None:
-    """Ghi một lượt gọi Gemini: token, các tool nó đề xuất, và text nếu có."""
+class Tracer:
+    """Ghi vết cho một phiên. Mỗi lượt hội thoại có số lượt riêng và các bước đánh số từ #01."""
+
+    def __init__(self, session_id: str):
+        self.tag = str(session_id)[:8]
+        self.turn = 0
+        self._n = 0
+        self._t0 = time.perf_counter()
+
+    def note(self, title: str, body=None) -> None:
+        """Ghi một dòng cấp phiên, ngoài các lượt (mở phiên...)."""
+        _write(f"[{_now()}] [{self.tag}] {title}\n{_format_body(body)}")
+
+    def begin_turn(self) -> None:
+        self.turn += 1
+        self._n = 0
+        self._t0 = time.perf_counter()
+        _write(f"[{_now()}] [{self.tag} L{self.turn}] {'=' * 10} LƯỢT {self.turn} BẮT ĐẦU {'=' * 10}\n")
+
+    def step(self, title: str, body=None) -> None:
+        self._n += 1
+        elapsed = time.perf_counter() - self._t0
+        _write(f"[{_now()}] [{self.tag} L{self.turn} #{self._n:02d} +{elapsed:.2f}s] {title}\n{_format_body(body)}")
+
+    def end_turn(self) -> None:
+        _write(f"[{_now()}] [{self.tag} L{self.turn}] {'=' * 10} LƯỢT {self.turn} KẾT THÚC {'=' * 10}\n\n")
+
+
+def _describe_part(part, limit: int = VALUE_LIMIT) -> str:
+    call = getattr(part, "function_call", None)
+    if call:
+        return f"function_call {call.name}({dump(dict(call.args or {}), limit)})"
+    reply = getattr(part, "function_response", None)
+    if reply:
+        return f"function_response {reply.name} -> {dump(reply.response, limit)}"
+    text = getattr(part, "text", None)
+    if text:
+        label = "thought" if getattr(part, "thought", False) else "text"
+        return f'{label} "{_clip(text, limit)}"'
+    return "part khác"
+
+
+def describe_contents(contents) -> list[str]:
+    """Liệt kê lịch sử đang gửi cho LLM: mỗi message một dòng, chỉ các message gần nhất."""
+    lines = []
+    shown = contents[-HISTORY_LINES:]
+    skipped = len(contents) - len(shown)
+    if skipped:
+        lines.append(f"... {skipped} message cũ hơn không liệt kê")
+    for i, content in enumerate(shown, start=skipped):
+        parts = "; ".join(_describe_part(p, 200) for p in (content.parts or []))
+        lines.append(f"[{i}] {content.role}: {parts}")
+    return lines
+
+
+def describe_response(response) -> tuple[str, str, list[str]]:
+    """Trả về (token, lý do kết thúc, các phần LLM trả về) của một lượt gọi Gemini."""
     usage = getattr(response, "usage_metadata", None)
     tokens = (f"prompt={usage.prompt_token_count} output={usage.candidates_token_count} "
               f"total={usage.total_token_count}") if usage else "n/a"
-    calls = [{"name": c.name, "args": dict(c.args or {})} for c in (response.function_calls or [])]
-    content = response.candidates[0].content if response.candidates else None
-    text = " ".join(p.text for p in (content.parts or []) if p.text) if content else ""
-    log(f"LLM #{step} ({seconds:.2f}s, tokens: {tokens})")
-    if calls:
-        log("  LLM đề xuất gọi tool", calls)
-    if text and calls:  # text của lượt cuối đã được ghi ở "TRẢ LỜI KHÁCH"
-        log("  LLM nói kèm", text)
+    candidate = response.candidates[0] if response.candidates else None
+    finish = getattr(candidate, "finish_reason", None)
+    finish = getattr(finish, "name", finish) or "n/a"
+    content = candidate.content if candidate else None
+    parts = [_describe_part(p) for p in (content.parts or [])] if content else []
+    return tokens, str(finish), parts

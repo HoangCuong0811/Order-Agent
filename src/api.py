@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from dotenv import load_dotenv
 
-load_dotenv()  # phải chạy trước khi import agent_trace (nó đọc AGENT_TRACE_FILE lúc import)
+load_dotenv()  # nạp .env sớm để chạy được cả khi khởi động bằng `uvicorn api:app`
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import agent
+import agent_trace as trace
 import tools
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -120,6 +121,7 @@ def validate_message(text: str) -> str | None:
 async def lifespan(app: FastAPI):
     tools.load_orders()
     app.state.client = agent.make_client()  # thiếu GEMINI_API_KEY thì lỗi ngay lúc khởi động
+    trace.event(f"SERVER SẴN SÀNG: model={agent.model_name()}, {len(tools.ORDERS)} đơn hàng mẫu")
     yield
 
 
@@ -137,10 +139,12 @@ def _run_turn(session_id: str, run) -> ChatOut:
     """Chạy một lượt trên phiên, từ chối nếu phiên đang bận (không chạy song song trên cùng lịch sử)."""
     session = _get_session(session_id)
     if not session.lock.acquire(blocking=False):
+        session.agent.trace.note("YÊU CẦU BỊ TỪ CHỐI (409)", "phiên đang xử lý lượt trước")
         raise HTTPException(409, "Phiên đang xử lý tin nhắn trước, vui lòng đợi.")
     try:
         return to_response(run(session.agent))
     except agent.ApprovalStateError as e:
+        session.agent.trace.note("YÊU CẦU BỊ TỪ CHỐI (409)", str(e))
         raise HTTPException(409, f"Không thực hiện được: {e}.")
     finally:
         session.lock.release()
@@ -157,7 +161,7 @@ def health() -> dict:
 def create_session() -> dict:
     session_id = uuid.uuid4().hex
     with _sessions_lock:
-        SESSIONS[session_id] = Session(agent.SupportAgent(app.state.client))
+        SESSIONS[session_id] = Session(agent.SupportAgent(app.state.client, session_id))
         while len(SESSIONS) > MAX_SESSIONS:
             SESSIONS.popitem(last=False)
     return {"session_id": session_id}
@@ -167,6 +171,7 @@ def create_session() -> dict:
 def send_message(session_id: str, body: MessageIn) -> ChatOut:
     error = validate_message(body.message)
     if error:
+        trace.event(f"[{session_id[:8]}] TIN NHẮN BỊ TỪ CHỐI (400), không gọi LLM", error)
         raise HTTPException(400, error)
     return _run_turn(session_id, lambda a: a.chat(body.message))
 
