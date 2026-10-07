@@ -46,7 +46,7 @@ Mở `.env` và cập nhật:
 |---|---|
 | `GEMINI_API_KEY` | API key của bạn (lấy tại Google AI Studio). **Bắt buộc.** |
 | `GEMINI_MODEL` | Tên model Gemini. Mặc định `gemini-3.5-flash-lite`. |
-| `HOST`, `PORT` | Địa chỉ và cổng của server. Mặc định `127.0.0.1:8000`. Không bắt buộc. |
+| `HOST`, `PORT` | Địa chỉ và cổng của server. Mặc định `localhost:8000` (nghe cả IPv4 `127.0.0.1` và IPv6 `::1`, chỉ trong máy). Không bắt buộc. |
 
 File `.env` đã nằm trong `.gitignore`, không commit key lên git.
 

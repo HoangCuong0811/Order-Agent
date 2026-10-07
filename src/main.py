@@ -19,7 +19,9 @@ def main() -> int:
 
     import api
 
-    host = os.getenv("HOST", "127.0.0.1")
+    # "localhost" (không phải "127.0.0.1") để nghe cả IPv4 và IPv6 của máy này. Trình duyệt Windows thử ::1 trước,
+    # nếu server chỉ nghe IPv4 thì mỗi kết nối mới mất thêm ~2 giây trước khi chuyển sang IPv4.
+    host = os.getenv("HOST", "localhost")
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(api.app, host=host, port=port)
     return 0
