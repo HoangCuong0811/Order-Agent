@@ -83,6 +83,8 @@ flowchart LR
     RES -- "đã gọi LLM đủ 5 lần" --> ESC(["THOÁT: escalate<br/>cho nhân viên"])
 ```
 
+> **Note:** Từng bước của agent (lịch sử gửi cho LLM, tool call LLM đề xuất, quyết định của policy, kết quả tool, câu trả lời) được log ra console của backend (`src/agent_trace.py`) để kiểm tra quá trình suy luận của LLM.
+
 
 ### Mức quyết định của guardrail
 
@@ -117,5 +119,6 @@ flowchart LR
 
 1. **Không dùng dữ liệu thật.** Dữ liệu là 9 đơn mẫu trong `data/orders.json`, chỉ lưu trong bộ nhớ: mỗi phiên có bản sao riêng, mất khi server khởi động lại, server giữ tối đa 200 phiên gần nhất và chạy một process. Chưa có xác thực khách hàng hay nhân viên: ai biết mã đơn đều thao tác được đơn đó, và ai cũng gọi được `/approval`.
 2. **Chưa có kiến thức chuyên sâu về domain đơn hàng và vận hành, nên các hành động cuối chỉ là giả lập.** Hoàn tiền không gọi cổng thanh toán, `escalate_to_human` chỉ in ra console. Hoàn hàng chỉ nhập tay video (không upload, không kiểm tra), duyệt là đổi đơn sang `returned` và hoàn toàn bộ số tiền còn lại, không hoàn một phần, không có thời hạn hoàn hàng. Huỷ đơn không tự hoàn tiền. Luật nghiệp vụ là hằng số trong `src/policy.py` (ví dụ ngưỡng 500 chỉ để gắn cờ cảnh báo), chưa cấu hình được từ ngoài. Lượt lỗi không hoàn tác tool đã chạy: nếu tool đã thực thi rồi Gemini mới lỗi thì lịch sử được khôi phục nhưng thay đổi dữ liệu vẫn còn.
-3. **Phụ thuộc vào Gemini.** Chỉ dùng một model Gemini, cần mạng và API key hợp lệ. Khi API lỗi hoặc quá tải thì lượt đó chỉ trả thông báo lỗi; thực tế cần một lớp router để chuyển sang LLM khác khi Gemini không dùng được. Chất lượng câu trả lời và việc tuân thủ định dạng 3 dòng cuối phụ thuộc model (guardrail vẫn an toàn dù model trả lời sai định dạng), chưa kiểm thử với nhiều model, và chưa có cơ chế chống prompt injection riêng (guardrail vẫn chặn được hành động nhạy cảm nhưng agent có thể bị dẫn dắt trả lời lạc đề).
-4. **Chưa có test tự động trong repo.**
+3. **Phụ thuộc vào Gemini.** Chỉ dùng một model Gemini, cần mạng và API key hợp lệ. Khi API lỗi hoặc quá tải thì lượt đó chỉ trả thông báo lỗi; thực tế cần một lớp router để chuyển sang LLM khác khi Gemini không dùng được. Chất lượng câu trả lời và việc tuân thủ định dạng 3 dòng cuối phụ thuộc model (guardrail vẫn an toàn dù model trả lời sai định dạng), chưa kiểm thử với nhiều model.
+4. **Chưa có cơ chế chống prompt injection, đang để tự LLM xử lý.** Không có lớp lọc hay kiểm tra input riêng. Guardrail trong `src/policy.py` vẫn chặn được hành động nhạy cảm, nhưng agent có thể bị dẫn dắt trả lời lạc đề.
+5. **Chưa có test tự động trong repo.**
